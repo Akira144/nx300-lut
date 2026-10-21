@@ -19,7 +19,9 @@ jobs:
           name: lutd-arm
           path: |
             lutd.arm
+            lutd-hf.arm
             lutd-musl.arm
             nx300-lut/lutd.arm
+            nx300-lut/lutd-hf.arm
             nx300-lut/lutd-musl.arm
           if-no-files-found: error
