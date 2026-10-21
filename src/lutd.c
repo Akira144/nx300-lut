@@ -390,6 +390,7 @@ static int apply_jpeg(const char *in, const char *out, const Lut *L, int quality
     if (d.image_width < 16 || d.image_height < 16) { rc = -2; goto done; }
 
     d.out_color_space = JCS_RGB;
+    d.dct_method = JDCT_IFAST;      /* speed over the last bit of accuracy */
     jpeg_start_decompress(&d);
 
     w = (int)d.output_width;
@@ -413,6 +414,7 @@ static int apply_jpeg(const char *in, const char *out, const Lut *L, int quality
         }
     }
     jpeg_set_quality(&c, quality, TRUE);
+    c.dct_method = JDCT_IFAST;      /* shorter write window = safer on power loss */
     jpeg_start_compress(&c, TRUE);
 
     if (keep_meta) {
@@ -487,6 +489,31 @@ static void mkdir_p(const char *path)
     mkdir(tmp, 0777);
 }
 
+/* remove leftovers of an interrupted run (.lutd-*.tmp / .lutd-*.preview.jpg) */
+static void cleanup_stale(const char *dir, int depth)
+{
+    DIR *d;
+    struct dirent *e;
+    char sub[PATH_BIG];
+
+    if (depth > 4 || !(d = opendir(dir))) return;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') {
+            if (!strncmp(e->d_name, ".lutd-", 6)) {
+                snprintf(sub, sizeof sub, "%s/%s", dir, e->d_name);
+                if (unlink(sub) == 0) logmsg("cleanup stale %s", sub);
+            }
+            continue;
+        }
+        snprintf(sub, sizeof sub, "%s/%s", dir, e->d_name);
+        {
+            struct stat st;
+            if (stat(sub, &st) == 0 && S_ISDIR(st.st_mode)) cleanup_stale(sub, depth + 1);
+        }
+    }
+    closedir(d);
+}
+
 /* ------------------------------------------------------------------ */
 /* config                                                              */
 
@@ -512,11 +539,11 @@ static void cfg_defaults(Cfg *c)
     snprintf(c->log, sizeof c->log, "/mnt/mmc/lutd.log");
     snprintf(c->mode, sizeof c->mode, "replace");
     snprintf(c->suffix, sizeof c->suffix, "_LUT");
-    snprintf(c->origdir, sizeof c->origdir, "/mnt/mmc/.lut/orig");
+    snprintf(c->origdir, sizeof c->origdir, "/mnt/mmc/lut/orig");
     c->keep_orig = 1;
     c->keep_meta = 1;
     c->srw = 1;
-    c->quality = 95;
+    c->quality = 92;
     c->min_bytes = 100000;
 }
 
@@ -608,6 +635,7 @@ static void handle_file(const Cfg *cfg, const Lut *L, const char *dir, const cha
     }
 
     snprintf(in, sizeof in, "%s/%s", dir, name);
+    if (cfg->origdir[0] && strstr(in, cfg->origdir)) return;   /* never touch our own backups */
     if (guard_hit(in)) return;
     if (stat(in, &st) != 0) return;
     if (st.st_size < cfg->min_bytes) return;
@@ -644,6 +672,7 @@ static void handle_file(const Cfg *cfg, const Lut *L, const char *dir, const cha
             unlink(tmp);
             return;
         }
+        guard_add(orig);
         if (rename(tmp, in) != 0) {
             logmsg("cannot replace %s: %s (restoring)", in, strerror(errno));
             rename(orig, in);
@@ -916,6 +945,7 @@ static int daemon_run(Cfg *cfg)
     if (cfg->keep_orig) mkdir_p(cfg->origdir);
 
     if ((fd = inotify_init1(IN_CLOEXEC)) < 0) { logmsg("inotify: %s", strerror(errno)); return 1; }
+    cleanup_stale(cfg->watch, 0);
     watch_tree(fd, cfg->watch, 0);
     logmsg("watching %s (%d dirs), mode=%s, quality=%d, keep_orig=%d, srw=%d",
            cfg->watch, g_nwd, cfg->mode, cfg->quality, cfg->keep_orig, cfg->srw);
