@@ -352,8 +352,17 @@ static int build_app1(unsigned char *p, int orientation, const char *dt)
 /* ------------------------------------------------------------------ */
 /* JPEG                                                                */
 
-static int apply_jpeg(const char *in, const char *out, const Lut *L, int quality,
-                      int keep_meta, int orientation, const char *dt)
+/* how closely to mimic the camera's own JPEG container */
+typedef struct {
+    int quality;
+    int copy_app1;    /* keep EXIF                                       */
+    int copy_app2;    /* keep APP2 (Samsung/MPF/ICC)                     */
+    int no_jfif;      /* do not emit the JFIF APP0 header                */
+    int copy_dri;     /* reuse the source's restart interval             */
+} Enc;
+
+static int apply_jpeg(const char *in, const char *out, const Lut *L,
+                      const Enc *e, int orientation, const char *dt)
 {
     struct jpeg_decompress_struct d;
     struct jpeg_compress_struct c;
@@ -380,10 +389,8 @@ static int apply_jpeg(const char *in, const char *out, const Lut *L, int quality
     jpeg_create_decompress(&d);
     dok = 1;
     jpeg_stdio_src(&d, fi);
-    if (keep_meta) {
-        jpeg_save_markers(&d, JPEG_APP0 + 1, 0xFFFF);   /* EXIF */
-        jpeg_save_markers(&d, JPEG_APP0 + 2, 0xFFFF);   /* ICC  */
-    }
+    if (e->copy_app1) jpeg_save_markers(&d, JPEG_APP0 + 1, 0xFFFF);   /* EXIF */
+    if (e->copy_app2) jpeg_save_markers(&d, JPEG_APP0 + 2, 0xFFFF);   /* APP2 */
     jpeg_read_header(&d, TRUE);
 
     if (d.progressive_mode) { logmsg("skip progressive jpeg: %s", in); rc = -2; goto done; }
@@ -413,11 +420,17 @@ static int apply_jpeg(const char *in, const char *out, const Lut *L, int quality
             c.comp_info[i].v_samp_factor = d.comp_info[i].v_samp_factor;
         }
     }
-    jpeg_set_quality(&c, quality, TRUE);
+    jpeg_set_quality(&c, e->quality, TRUE);
     c.dct_method = JDCT_IFAST;      /* shorter write window = safer on power loss */
+    if (e->no_jfif) {               /* camera files start with APP1, no JFIF APP0 */
+        c.write_JFIF_header = FALSE;
+        c.write_Adobe_marker = FALSE;
+    }
+    if (e->copy_dri && d.restart_interval)
+        c.restart_interval = d.restart_interval;   /* Samsung decoders expect RSTn */
     jpeg_start_compress(&c, TRUE);
 
-    if (keep_meta) {
+    if (e->copy_app1 || e->copy_app2) {
         jpeg_saved_marker_ptr m;
         for (m = d.marker_list; m; m = m->next)
             jpeg_write_marker(&c, m->marker, m->data, m->data_length);
@@ -525,11 +538,23 @@ typedef struct {
     char suffix[32];
     char origdir[PATH_MAX2];
     int keep_orig;
-    int keep_meta;
+    int copy_app1;
+    int copy_app2;
+    int no_jfif;
+    int copy_dri;
     int srw;
     int quality;
     long min_bytes;
 } Cfg;
+
+static void enc_from_cfg(const Cfg *cfg, Enc *e)
+{
+    e->quality   = cfg->quality;
+    e->copy_app1 = cfg->copy_app1;
+    e->copy_app2 = cfg->copy_app2;
+    e->no_jfif   = cfg->no_jfif;
+    e->copy_dri  = cfg->copy_dri;
+}
 
 static void cfg_defaults(Cfg *c)
 {
@@ -541,7 +566,10 @@ static void cfg_defaults(Cfg *c)
     snprintf(c->suffix, sizeof c->suffix, "_LUT");
     snprintf(c->origdir, sizeof c->origdir, "/mnt/mmc/lut/orig");
     c->keep_orig = 1;
-    c->keep_meta = 1;
+    c->copy_app1 = 1;
+    c->copy_app2 = 1;
+    c->no_jfif = 1;
+    c->copy_dri = 1;
     c->srw = 1;
     c->quality = 92;
     c->min_bytes = 100000;
@@ -571,7 +599,15 @@ static void cfg_load(Cfg *c, const char *path)
         else if (!strcasecmp(p, "SUFFIX")) snprintf(c->suffix, sizeof c->suffix, "%s", eq);
         else if (!strcasecmp(p, "ORIG_DIR")) snprintf(c->origdir, sizeof c->origdir, "%s", eq);
         else if (!strcasecmp(p, "KEEP_ORIG")) c->keep_orig = atoi(eq) != 0;
-        else if (!strcasecmp(p, "KEEP_META")) c->keep_meta = atoi(eq) != 0;
+        else if (!strcasecmp(p, "KEEP_META")) {
+            int v = atoi(eq) != 0;
+            c->copy_app1 = v;
+            c->copy_app2 = v;
+        }
+        else if (!strcasecmp(p, "COPY_APP1")) c->copy_app1 = atoi(eq) != 0;
+        else if (!strcasecmp(p, "COPY_APP2")) c->copy_app2 = atoi(eq) != 0;
+        else if (!strcasecmp(p, "NO_JFIF")) c->no_jfif = atoi(eq) != 0;
+        else if (!strcasecmp(p, "COPY_DRI")) c->copy_dri = atoi(eq) != 0;
         else if (!strcasecmp(p, "SRW")) c->srw = atoi(eq) != 0;
         else if (!strcasecmp(p, "QUALITY")) c->quality = atoi(eq);
         else if (!strcasecmp(p, "MIN_BYTES")) c->min_bytes = atol(eq);
@@ -651,7 +687,11 @@ static void handle_file(const Cfg *cfg, const Lut *L, const char *dir, const cha
     }
 
     logmsg("apply %s (%ld bytes) -> %s", in, (long)st.st_size, out);
-    rc = apply_jpeg(in, out, L, cfg->quality, cfg->keep_meta, 0, NULL);
+    {
+        Enc e;
+        enc_from_cfg(cfg, &e);
+        rc = apply_jpeg(in, out, L, &e, 0, NULL);
+    }
     if (rc != 0) {
         logmsg("failed rc=%d: %s", rc, in);
         unlink(tmp);
@@ -870,8 +910,12 @@ static void handle_srw(const Cfg *cfg, const Lut *L, const char *dir, const char
     snprintf(out, sizeof out, "%s/%s.JPG", dir, base);
     snprintf(tmp2, sizeof tmp2, "%s/.lutd-%s.jpg.tmp", dir, base);
 
-    rc = apply_jpeg(tmp, tmp2, L, cfg->quality, cfg->keep_meta,
-                    si.orientation, si.datetime[0] ? si.datetime : NULL);
+    {
+        Enc e;
+        enc_from_cfg(cfg, &e);
+        rc = apply_jpeg(tmp, tmp2, L, &e,
+                        si.orientation, si.datetime[0] ? si.datetime : NULL);
+    }
     unlink(tmp);
     if (rc != 0) {
         logmsg("srw: lut failed rc=%d %s", rc, name);
@@ -1016,7 +1060,14 @@ int main(int argc, char **argv)
         if (q > 100) q = 100;
         if (lut_load(argv[4], &L) != 0) return 1;
         lut_prepare(&L);
-        rc = apply_jpeg(argv[2], argv[3], &L, q, 1, 0, NULL);
+        {
+            Enc e;
+            memset(&e, 0, sizeof e);
+            e.quality = q;
+            e.copy_app1 = 1;
+            e.copy_app2 = 1;
+            rc = apply_jpeg(argv[2], argv[3], &L, &e, 0, NULL);
+        }
         fprintf(stderr, "lutd: %s\n", rc == 0 ? "ok" : "failed");
         return rc == 0 ? 0 : 1;
     }
