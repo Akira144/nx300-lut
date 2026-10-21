@@ -1,9 +1,5 @@
 name: build-lutd
 
-# 云端编译：不需要本机装 Linux。
-# 手动触发：仓库页面 -> Actions -> build-lutd -> Run workflow
-# 结果：Run 页面底部 Artifacts -> lutd-arm.zip
-
 on:
   workflow_dispatch:
   push:
@@ -14,64 +10,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: toolchain
+      - name: build
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake gcc-arm-linux-gnueabi \
-            libjpeg-turbo8-dev python3-pip
-          sudo pip3 install --quiet --break-system-packages pillow
-
-      - name: libjpeg-turbo for armel
-        run: |
-          git clone --depth 1 https://github.com/libjpeg-turbo/libjpeg-turbo.git /tmp/ljt
-          cmake -S /tmp/ljt -B /tmp/ljt/build \
-            -DCMAKE_SYSTEM_NAME=Linux \
-            -DCMAKE_SYSTEM_PROCESSOR=arm \
-            -DCMAKE_C_COMPILER=arm-linux-gnueabi-gcc \
-            -DWITH_SIMD=0 -DENABLE_SHARED=0 -DWITH_TURBOJPEG=0 \
-            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/arm-jpeg"
-          cmake --build /tmp/ljt/build -j"$(nproc)"
-          cmake --install /tmp/ljt/build
-
-      - name: host build + smoke test
-        run: |
-          set -e
-          DIR="."
-          [ -f Makefile ] || DIR="nx300-lut"
-          cd "$DIR"
-          make
-
-          python3 -c "
-from PIL import Image
-im = Image.new('RGB', (640, 480))
-im.putdata([(x*255//639, y*255//479, 128) for y in range(480) for x in range(640)])
-im.save('/tmp/in.jpg', quality=92)
-"
-
-          python3 -c "
-n = 17
-print('TITLE \"smoke\"')
-print('LUT_3D_SIZE %d' % n)
-for b in range(n):
-    for g in range(n):
-        for r in range(n):
-            R, G, B = r/(n-1), g/(n-1), b/(n-1)
-            print('%.6f %.6f %.6f' % (min(1.0, R*1.06), G, min(1.0, B*0.9)))
-" > /tmp/warm.cube
-
-          ./lutd --once /tmp/in.jpg /tmp/out.jpg /tmp/warm.cube 95
-          file /tmp/out.jpg
-          ls -l /tmp/in.jpg /tmp/out.jpg
-
-      - name: cross build
-        run: |
-          set -e
-          DIR="."
-          [ -f Makefile ] || DIR="nx300-lut"
-          cd "$DIR"
-          make arm CROSS=arm-linux-gnueabi- JPEG_ARM="$GITHUB_WORKSPACE/arm-jpeg"
-          file lutd.arm
+          if [ -f ci.sh ]; then bash ci.sh; else bash nx300-lut/ci.sh; fi
 
       - uses: actions/upload-artifact@v4
         with:
