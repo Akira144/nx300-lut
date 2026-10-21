@@ -35,6 +35,7 @@
 
 #define LUT_MAX   65
 #define PATH_MAX2 1024
+#define PATH_BIG  (PATH_MAX2 + 320)   /* config path + "/" + filename */
 
 /* ------------------------------------------------------------------ */
 /* logging                                                             */
@@ -594,7 +595,7 @@ static int guard_hit(const char *p)
 
 static void handle_file(const Cfg *cfg, const Lut *L, const char *dir, const char *name)
 {
-    char in[PATH_MAX2], tmp[PATH_MAX2], out[PATH_MAX2], orig[PATH_MAX2];
+    char in[PATH_BIG], tmp[PATH_BIG], out[PATH_BIG], orig[PATH_BIG];
     struct stat st;
     int rc;
 
@@ -803,7 +804,7 @@ static int srw_extract(const char *path, long off, long len, const char *out)
 
 static void handle_srw(const Cfg *cfg, const Lut *L, const char *dir, const char *name)
 {
-    char in[PATH_MAX2], sib[PATH_MAX2], tmp[PATH_MAX2], tmp2[PATH_MAX2], out[PATH_MAX2];
+    char in[PATH_BIG], sib[PATH_BIG], tmp[PATH_BIG], tmp2[PATH_BIG], out[PATH_BIG];
     char base[256];
     struct stat st;
     SrwInfo si;
@@ -887,7 +888,7 @@ static void watch_tree(int fd, const char *dir, int depth)
 {
     DIR *d;
     struct dirent *e;
-    char sub[PATH_MAX2];
+    char sub[PATH_BIG];
 
     if (depth > 4) return;
     wd_add(fd, dir);
@@ -940,7 +941,7 @@ static int daemon_run(Cfg *cfg)
             const char *dir = wd_path(ev->wd);
 
             if (dir && ev->len > 0 && ev->name[0]) {
-                char sub[PATH_MAX2];
+                char sub[PATH_BIG];
                 if (ev->mask & IN_ISDIR) {
                     if (ev->mask & IN_CREATE) {
                         snprintf(sub, sizeof sub, "%s/%s", dir, ev->name);
