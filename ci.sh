@@ -34,8 +34,23 @@ if [ -z "$CROSS_PKG" ]; then
     echo "!! 没有可用的 ARM 交叉编译器，停止"
     exit 1
 fi
+
+# 目标平台 libc 的开发文件（crt1.o / crti.o 在里面，缺了链接必失败）
+case "$CROSS_PKG" in
+    *gnueabihf) CROSS_LIBC=libc6-dev-armhf-cross ;;
+    *)          CROSS_LIBC=libc6-dev-armel-cross ;;
+esac
+echo "-- 安装 $CROSS_LIBC"
+sudo apt-get install -y "$CROSS_LIBC"
+
 CROSS="${CROSS_PKG#gcc-}-"
 echo "CROSS=$CROSS"
+
+echo "-- 验证交叉编译器能产出静态可执行文件"
+echo 'int main(void){return 0;}' > /tmp/t.c
+"${CROSS}gcc" -static -o /tmp/t /tmp/t.c
+file /tmp/t
+rm -f /tmp/t.c /tmp/t
 
 echo
 echo "== libjpeg 开发头文件（自动回退包名）"
