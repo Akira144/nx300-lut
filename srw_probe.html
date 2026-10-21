@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>SRW 探针 - 三星 RAW 结构查看</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 28px 20px 60px;
+    font: 14px/1.65 "Segoe UI", system-ui, sans-serif;
+    background: #14161a; color: #e6e8eb;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 19px; font-weight: 600; margin: 0 0 6px; }
+  .sub { color: #8b94a3; margin: 0 0 22px; font-size: 13px; }
+  .drop {
+    border: 1px dashed #3a4250; border-radius: 10px; padding: 26px;
+    text-align: center; background: #1a1e24; cursor: pointer;
+    transition: .15s border-color, .15s background;
+  }
+  .drop:hover, .drop.over { border-color: #4d8dff; background: #1c2230; }
+  .drop b { color: #6ea8ff; }
+  input[type=file] { display: none; }
+  h2 { font-size: 14px; font-weight: 600; margin: 26px 0 8px; color: #b9c1cd; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px;
+          font-family: Consolas, "Cascadia Mono", monospace; }
+  td, th { text-align: left; padding: 3px 10px 3px 0; vertical-align: top; }
+  th { color: #79828f; font-weight: 500; }
+  td.k { color: #9ba6b4; white-space: nowrap; width: 190px; }
+  td.v { color: #e6e8eb; word-break: break-all; }
+  .verdict { margin-top: 18px; padding: 14px 16px; border-radius: 8px;
+             background: #1b2433; border-left: 3px solid #4d8dff; }
+  .verdict.good { background: #17281d; border-left-color: #43c463; }
+  .verdict.bad  { background: #2a1d1d; border-left-color: #e05d5d; }
+  .verdict b { display: block; margin-bottom: 4px; }
+  a.dl { display: inline-block; margin: 3px 10px 3px 0; padding: 4px 10px;
+         border-radius: 6px; background: #26303f; color: #9fc4ff;
+         text-decoration: none; font-size: 12.5px; }
+  a.dl:hover { background: #2f3c4f; }
+  .err { color: #ff8b8b; white-space: pre-wrap; font-family: Consolas, monospace; }
+  .hint { color: #79828f; font-size: 12.5px; margin-top: 10px; }
+  code { background: #21262e; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>SRW 探针</h1>
+  <p class="sub">
+    看三星 <code>.SRW</code> 里有什么：CFA 位深、压缩方式、以及内嵌 JPEG 预览的真实分辨率。<br>
+    纯本地运行，文件不会离开这台电脑。
+  </p>
+
+  <label class="drop" id="drop">
+    <div>把 <b>.SRW</b> 拖到这里，或者 <b>点击选择文件</b></div>
+    <div class="hint" id="fname">&nbsp;</div>
+    <input type="file" id="file" accept=".srw,.SRW,.raw,.RAW">
+  </label>
+
+  <div id="out"></div>
+</div>
+
+<script>
+"use strict";
+
+const TYPES = {1:1, 2:1, 3:2, 4:4, 5:8, 6:1, 7:1, 8:2, 9:4, 10:8, 11:4, 12:8};
+const TAGS = {
+  254:"NewSubfileType", 256:"ImageWidth", 257:"ImageLength", 258:"BitsPerSample",
+  259:"Compression", 262:"Photometric", 271:"Make", 272:"Model", 273:"StripOffsets",
+  277:"SamplesPerPixel", 278:"RowsPerStrip", 279:"StripByteCounts", 284:"PlanarConfig",
+  305:"Software", 306:"DateTime", 330:"SubIFDs", 34665:"ExifIFD", 34853:"GPSIFD",
+  50706:"DNGVersion", 50708:"UniqueCameraModel", 50717:"WhiteLevel",
+  50721:"ColorMatrix1", 50722:"ColorMatrix2"
+};
+const COMP = {1:"none", 6:"old JPEG", 7:"JPEG", 32767:"Samsung",
+              32773:"PackBits", 34892:"lossy JPEG", 65535:"?"};
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+function readVals(dv, le, type, count, fieldOff) {
+  const size = (TYPES[type] || 1) * count;
+  const base = size <= 4 ? fieldOff : dv.getUint32(fieldOff, le);
+  if (base + size > dv.byteLength) return [];
+  const out = [];
+  try {
+    if (type === 3)      for (let i = 0; i < count; i++) out.push(dv.getUint16(base + i*2, le));
+    else if (type === 4) for (let i = 0; i < count; i++) out.push(dv.getUint32(base + i*4, le));
+    else if (type === 1 || type === 7)
+                         for (let i = 0; i < count; i++) out.push(dv.getUint8(base + i));
+    else if (type === 2) {
+      let s = "";
+      for (let i = 0; i < count; i++) {
+        const c = dv.getUint8(base + i);
+        if (c === 0) break;
+        s += String.fromCharCode(c);
+      }
+      out.push(s);
+    } else if (type === 5 || type === 10) {
+      for (let i = 0; i < count; i++) {
+        const n = type === 5 ? dv.getUint32(base + i*8, le) : dv.getInt32(base + i*8, le);
+        const d = type === 5 ? dv.getUint32(base + i*8 + 4, le) : dv.getInt32(base + i*8 + 4, le);
+        out.push(d === 0 ? 0 : +(n / d).toFixed(4));
+      }
+    }
+  } catch (e) { /* 越界就算了 */ }
+  return out;
+}
+
+function jpegInfo(b, off) {
+  if (b[off] !== 0xFF || b[off+1] !== 0xD8) return null;
+  const hasExif = (b[off+2] === 0xFF && b[off+3] === 0xE1);
+  let p = off + 2, guard = 0;
+  while (p + 4 <= b.length && guard++ < 200000) {
+    if (b[p] !== 0xFF) { p++; continue; }
+    const m = b[p+1];
+    if (m === 0xD8 || m === 0x01 || (m >= 0xD0 && m <= 0xD7)) { p += 2; continue; }
+    if (m === 0xD9) return null;
+    const len = (b[p+2] << 8) | b[p+3];
+    if (m >= 0xC0 && m <= 0xCF && m !== 0xC4 && m !== 0xC8 && m !== 0xCC) {
+      const h = (b[p+5] << 8) | b[p+6];
+      const w = (b[p+7] << 8) | b[p+8];
+      const ncomp = b[p+9];
+      let samp = "?";
+      if (p + 12 <= b.length) samp = (b[p+11] >> 4) + "x" + (b[p+11] & 15);
+      const sofName = m === 0xC0 ? "Baseline" : m === 0xC1 ? "Ext-sequential"
+                    : m === 0xC2 ? "Progressive" : m === 0xC3 ? "Lossless"
+                    : "SOF" + m.toString(16);
+      let end = -1;
+      for (let q = p + 2 + len; q < b.length - 1; q++)
+        if (b[q] === 0xFF && b[q+1] === 0xD9) { end = q + 2; break; }
+      return { w, h, end, sofName, samp, ncomp, hasExif };
+    }
+    p += 2 + len;
+  }
+  return null;
+}
+
+function parse(ab, name) {
+  const b = new Uint8Array(ab);
+  const dv = new DataView(ab);
+  const html = [];
+
+  html.push('<h2>文件</h2><table>');
+  html.push(`<tr><td class="k">文件</td><td class="v">${esc(name)}</td></tr>`);
+  html.push(`<tr><td class="k">大小</td><td class="v">${b.length.toLocaleString()} 字节 (${(b.length/1048576).toFixed(1)} MB)</td></tr>`);
+  html.push(`<tr><td class="k">开头 4 字节</td><td class="v">${Array.from(b.slice(0,4)).map(x=>x.toString(16).padStart(2,"0")).join(" ")}</td></tr>`);
+  html.push('</table>');
+
+  let le;
+  if (b[0] === 0x49 && b[1] === 0x49) le = true;
+  else if (b[0] === 0x4D && b[1] === 0x4D) le = false;
+  else {
+    html.push('<div class="verdict bad"><b>这不是 TIFF 结构的 SRW</b>' +
+      '检查一下：是不是把 .JPG 当成 .SRW 了？或者文件没拷完整。</div>');
+    $("out").innerHTML = html.join("");
+    return;
+  }
+
+  const magic = dv.getUint16(2, le);
+  const ifd0 = dv.getUint32(4, le);
+  html.push(`<p class="hint">字节序：${le ? "小端 (II)" : "大端 (MM)"}，TIFF magic ${magic}，IFD0 @ 0x${ifd0.toString(16)}</p>`);
+
+  // ---- TIFF IFD 遍历 ----
+  const rows = [];
+  const seen = new Set();
+  (function walk(off, depth) {
+    if (depth > 3 || off <= 0 || off + 2 > b.length || seen.has(off)) return;
+    seen.add(off);
+    const n = dv.getUint16(off, le);
+    const subs = [];
+    const tagRows = [];
+    for (let i = 0; i < n; i++) {
+      const e = off + 2 + i * 12;
+      if (e + 12 > b.length) break;
+      const tag = dv.getUint16(e, le);
+      const type = dv.getUint16(e + 2, le);
+      const count = dv.getUint32(e + 4, le);
+      const vals = readVals(dv, le, type, count, e + 8);
+      const nm = TAGS[tag] || ("tag" + tag);
+      if (tag === 330 || tag === 34665 || tag === 34853) { subs.push(vals); continue; }
+      let v = vals;
+      if (tag === 259 && vals.length) v = [COMP[vals[0]] || vals[0]];
+      if (v.length > 6) v = v.slice(0, 6).concat(["..." + (v.length - 6) + " more"]);
+      tagRows.push(`<tr><td class="k">${nm}</td><td class="v">${esc(v.join(", "))}</td></tr>`);
+    }
+    rows.push(`<tr><th colspan="2" style="padding-top:10px">IFD @ 0x${off.toString(16)} — ${n} 项</th></tr>`);
+    rows.push(tagRows.join(""));
+    subs.forEach(arr => arr.forEach(o => walk(o, depth + 1)));
+    const next = dv.getUint32(off + 2 + n * 12, le);
+    if (next) walk(next, depth);
+  })(ifd0, 0);
+
+  html.push('<h2>TIFF 结构（关键项）</h2><table>' + rows.join("") + '</table>');
+
+  // ---- 扫内嵌 JPEG ----
+  const found = [];
+  for (let i = 0; i + 3 < b.length; i++) {
+    if (b[i] === 0xFF && b[i+1] === 0xD8 && b[i+2] === 0xFF) {
+      const j = jpegInfo(b, i);
+      if (j) found.push({ off: i, w: j.w, h: j.h, end: j.end,
+                          sofName: j.sofName, samp: j.samp, ncomp: j.ncomp, hasExif: j.hasExif });
+      i += 2;
+    }
+  }
+
+  html.push('<h2>内嵌 JPEG</h2><table>');
+  if (!found.length) html.push('<tr><td class="v">一个也没找到</td></tr>');
+  found.forEach((j, k) => {
+    const size = j.end > 0 ? (j.end - j.off) : 0;
+    html.push(`<tr><td class="k">[${k}] 0x${j.off.toString(16)}</td>` +
+      `<td class="v">${j.w} x ${j.h} &nbsp; ${size.toLocaleString()} 字节<br>` +
+      `<span style="color:#8b94a3">${j.sofName} &middot; 采样 ${j.samp} &middot; ${j.ncomp} 通道 &middot; ` +
+      `${j.hasExif ? "带 EXIF" : "无 EXIF"}</span> ` +
+      `<a class="dl" href="#" data-k="${k}">下载这张预览</a></td></tr>`);
+  });
+  html.push('</table>');
+
+  // ---- 结论 ----
+  const big = found.filter(j => j.w >= 3000);
+  let cls = "bad", title = "", body = "";
+  if (big.length) {
+    cls = "good";
+    title = "全尺寸预览存在 —— 这条路线可行";
+    body = `最大预览 ${big[0].w}x${big[0].h}。可以抽出来套 LUT 当 JPEG 用（1-2 秒/张），` +
+           `省掉自己解 RAW。注意这类预览压缩比正常拍摄高，画质会略肉。`;
+  } else if (found.length) {
+    title = "只有小预览 —— 抽预览没意义";
+    body = "要 RAW 就只能自己写解码器，成本很高。建议回到电脑上用 darktable / RawTherapee 处理。";
+  } else {
+    title = "没有内嵌 JPEG";
+    body = "只能自己解码 CFA 数据，工程量很大。";
+  }
+  html.push(`<div class="verdict ${cls}"><b>${title}</b>${body}</div>`);
+  html.push('<p class="hint">把上面「TIFF 结构」里的 Make / Model / BitsPerSample / Compression / SamplesPerPixel ' +
+            '和这一段的结论发给我就行。</p>');
+
+  $("out").innerHTML = html.join("");
+
+  // ---- 下载 ----
+  document.querySelectorAll("a.dl").forEach(a => {
+    a.addEventListener("click", ev => {
+      ev.preventDefault();
+      const j = found[+a.dataset.k];
+      const end = j.end > 0 ? j.end : b.length;
+      const blob = new Blob([b.slice(j.off, end)], { type: "image/jpeg" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `preview_${j.w}x${j.h}.jpg`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    });
+  });
+}
+
+function handle(file) {
+  if (!file) return;
+  $("fname").textContent = `${file.name} — ${(file.size/1048576).toFixed(1)} MB`;
+  $("out").innerHTML = '<p class="hint">读取中…</p>';
+  const fr = new FileReader();
+  fr.onload = () => {
+    try { parse(fr.result, file.name); }
+    catch (err) {
+      $("out").innerHTML = '<div class="verdict bad"><b>解析出错</b>' +
+        '<div class="err">' + esc(err && err.stack || err) + '</div></div>';
+    }
+  };
+  fr.onerror = () => {
+    $("out").innerHTML = '<div class="verdict bad"><b>读不了这个文件</b>先把它拷到硬盘上再试。</div>';
+  };
+  fr.readAsArrayBuffer(file);
+}
+
+const drop = $("drop");
+$("file").addEventListener("change", e => handle(e.target.files[0]));
+["dragenter","dragover"].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.add("over");
+}));
+["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.remove("over");
+}));
+drop.addEventListener("drop", e => {
+  if (e.dataTransfer.files && e.dataTransfer.files[0]) handle(e.dataTransfer.files[0]);
+});
+</script>
+</body>
+</html>
