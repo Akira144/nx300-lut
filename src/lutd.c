@@ -32,6 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <jpeglib.h>
+#include <linux/input.h>
 
 #define LUT_MAX   65
 #define PATH_MAX2 1024
@@ -366,6 +367,106 @@ static int lut_maybe_reload(void)
     snprintf(g_lut_cur, sizeof g_lut_cur, "%s", path);
     logmsg("lut: using %s (3D %d^3, 1D %d)", path, g_lut.n3, g_lut.n1);
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* 相机按键：热切换 LUT                                                */
+/* 只读 /dev/input/eventN，不 grab、不吞事件，相机自己照常收到按键。    */
+/* ------------------------------------------------------------------ */
+
+static int g_in_fd[8];
+static int g_in_n = 0;
+static int g_hotkey = 0;
+static int g_probe_keys = 0;
+
+static void input_open(void)
+{
+    int i;
+
+    for (i = 0; i < 8 && g_in_n < 8; i++) {
+        char p[64];
+        int fd;
+        snprintf(p, sizeof p, "/dev/input/event%d", i);
+        fd = open(p, O_RDONLY | O_NONBLOCK);
+        if (fd >= 0) g_in_fd[g_in_n++] = fd;
+    }
+    logmsg("input: opened %d event device(s), hotkey=%d, probe=%d",
+           g_in_n, g_hotkey, g_probe_keys);
+}
+
+/* 切到目录里下一个 .cube，并写进 active 保存选择 */
+static void hotkey_next(void)
+{
+    DIR *d;
+    struct dirent *e;
+    char names[32][256];
+    int n = 0, i, j, cur = -1, next;
+    const char *base;
+
+    if (!(d = opendir(g_lut_dir))) return;
+    while ((e = readdir(d)) && n < 32) {
+        size_t l = strlen(e->d_name);
+        if (l < 6 || l > 200) continue;
+        if (strcasecmp(e->d_name + l - 5, ".cube")) continue;
+        snprintf(names[n], sizeof names[n], "%s", e->d_name);
+        n++;
+    }
+    closedir(d);
+    if (n < 2) {
+        logmsg("hotkey: need at least 2 .cube files in %s", g_lut_dir);
+        led_blink(1);
+        return;
+    }
+
+    for (i = 1; i < n; i++) {                 /* 简单插入排序 */
+        char tmp[256];
+        snprintf(tmp, sizeof tmp, "%s", names[i]);
+        for (j = i - 1; j >= 0 && strcasecmp(names[j], tmp) > 0; j--)
+            snprintf(names[j + 1], sizeof names[j + 1], "%s", names[j]);
+        snprintf(names[j + 1], sizeof names[j + 1], "%s", tmp);
+    }
+
+    base = strrchr(g_lut_cur, '/');
+    base = base ? base + 1 : g_lut_cur;
+    for (i = 0; i < n; i++)
+        if (!strcasecmp(names[i], base)) { cur = i; break; }
+
+    next = (cur + 1) % n;
+
+    {
+        char ap[PATH_BIG];
+        FILE *f;
+        snprintf(ap, sizeof ap, "%s/active", g_lut_dir);
+        if ((f = fopen(ap, "w"))) {
+            fprintf(f, "%s\n", names[next]);
+            fclose(f);
+        }
+    }
+    lut_maybe_reload();
+    logmsg("hotkey: %s (%d/%d)", names[next], next + 1, n);
+    led_blink(next + 1);                      /* 闪 N 下 = 第 N 个 */
+}
+
+static void input_handle(void)
+{
+    int i;
+
+    for (i = 0; i < g_in_n; i++) {
+        uint8_t buf[512];
+        ssize_t len;
+
+        while ((len = read(g_in_fd[i], buf, sizeof buf)) > 0) {
+            size_t off = 0;
+            while (off + sizeof(struct input_event) <= (size_t)len) {
+                struct input_event ev;
+                memcpy(&ev, buf + off, sizeof ev);
+                off += sizeof ev;
+                if (ev.type != EV_KEY || ev.value != 1) continue;
+                if (g_probe_keys) logmsg("key: code=%d", ev.code);
+                if (g_hotkey && ev.code == g_hotkey) hotkey_next();
+            }
+        }
+    }
 }
 
 static void apply_row(const Lut *L, unsigned char *row, int w)
@@ -846,6 +947,8 @@ typedef struct {
     int thumb;
     int overlay;
     char led[192];
+    int hotkey;
+    int probe_keys;
     int srw;
     int quality;
     long min_bytes;
@@ -878,6 +981,8 @@ static void cfg_defaults(Cfg *c)
     c->thumb = 1;
     c->overlay = 1;
     snprintf(c->led, sizeof c->led, "%s", "/sys/class/leds/card/brightness");
+    c->hotkey = 0;
+    c->probe_keys = 0;
     c->srw = 1;
     c->quality = 92;
     c->min_bytes = 100000;
@@ -919,6 +1024,8 @@ static void cfg_load(Cfg *c, const char *path)
         else if (!strcasecmp(p, "THUMB")) c->thumb = atoi(eq) != 0;
         else if (!strcasecmp(p, "OVERLAY")) c->overlay = atoi(eq) != 0;
         else if (!strcasecmp(p, "LED")) snprintf(c->led, sizeof c->led, "%s", eq);
+        else if (!strcasecmp(p, "HOTKEY")) c->hotkey = atoi(eq);
+        else if (!strcasecmp(p, "PROBE_KEYS")) c->probe_keys = atoi(eq) != 0;
         else if (!strcasecmp(p, "SRW")) c->srw = atoi(eq) != 0;
         else if (!strcasecmp(p, "QUALITY")) c->quality = atoi(eq);
         else if (!strcasecmp(p, "MIN_BYTES")) c->min_bytes = atol(eq);
@@ -1302,6 +1409,9 @@ static int daemon_run(Cfg *cfg)
     lut_set_paths(cfg->lut);
     g_overlay_on = cfg->overlay;
     snprintf(g_led, sizeof g_led, "%s", cfg->led);
+    g_hotkey = cfg->hotkey;
+    g_probe_keys = cfg->probe_keys;
+    input_open();
     if (lut_maybe_reload() != 0) {
         logmsg("cannot load any LUT (tried %s/active and %s)", g_lut_dir, cfg->lut);
         return 1;
@@ -1317,18 +1427,27 @@ static int daemon_run(Cfg *cfg)
 
     for (;;) {
         fd_set rf;
-        int n;
+        int n, i, maxfd = fd;
         char buf[8192];
         ssize_t len, off;
 
         FD_ZERO(&rf);
         FD_SET(fd, &rf);
+        for (i = 0; i < g_in_n; i++) {
+            FD_SET(g_in_fd[i], &rf);
+            if (g_in_fd[i] > maxfd) maxfd = g_in_fd[i];
+        }
         ts.tv_sec = 2;
         ts.tv_nsec = 0;
-        n = pselect(fd + 1, &rf, NULL, NULL, &ts, NULL);
+        n = pselect(maxfd + 1, &rf, NULL, NULL, &ts, NULL);
         if (n <= 0) continue;
 
-        len = read(fd, buf, sizeof buf);
+        if (FD_ISSET(fd, &rf)) {
+            len = read(fd, buf, sizeof buf);
+        } else {
+            len = -1;
+        }
+        input_handle();
         if (len <= 0) continue;
 
         for (off = 0; off < len; ) {
