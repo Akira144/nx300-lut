@@ -21,7 +21,9 @@ jobs:
             lutd.arm
             lutd-hf.arm
             lutd-musl.arm
+            lutshow-hf.arm
             nx300-lut/lutd.arm
             nx300-lut/lutd-hf.arm
             nx300-lut/lutd-musl.arm
+            nx300-lut/lutshow-hf.arm
           if-no-files-found: error
