@@ -22,6 +22,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -312,7 +313,6 @@ static void x_drain(const char *tag)
 {
     uint8_t b[64];
     ssize_t n;
-    int i;
 
     fcntl(g_fd, F_SETFL, fcntl(g_fd, F_GETFL, 0) | O_NONBLOCK);
     while ((n = read(g_fd, b, sizeof b)) > 0) {
@@ -320,6 +320,7 @@ static void x_drain(const char *tag)
             fprintf(stderr, "lutshow: %s X error code=%d\n", tag, b[1]);
         }
     }
+    (void)n;
 }
 
 static void x_unmap(uint32_t win)
