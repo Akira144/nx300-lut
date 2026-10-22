@@ -267,9 +267,9 @@ static uint32_t x_window(const Screen *s, int x, int y, int w, int h, unsigned l
     return win;
 }
 
-static uint32_t x_gc(uint32_t win, unsigned long fg)
+static uint32_t x_gc(uint32_t win, unsigned long fg, unsigned slot)
 {
-    uint32_t gc = g_id_base | 0x00000200u;
+    uint32_t gc = g_id_base | (0x00000200u + slot);
 
     begin(55, 0);
     p32(gc); p32(win); p32(4); p32((uint32_t)fg);
@@ -285,6 +285,41 @@ static void x_rect(uint32_t win, uint32_t gc, int x, int y, int w, int h)
     p16((unsigned)x); p16((unsigned)y); p16((unsigned)w); p16((unsigned)h);
     end();
     send_req();
+}
+
+static void x_map(uint32_t win)
+{
+    begin(8, 0);
+    p32(win);
+    end();
+    send_req();
+}
+
+/* 把窗口提到最上层（ConfigureWindow, stack-mode=Above） */
+static void x_raise(uint32_t win)
+{
+    begin(12, 0);
+    p32(win);
+    p16(64);        /* CWStackMode */
+    p16(0);
+    p32(0);         /* Above */
+    end();
+    send_req();
+}
+
+/* 读掉挂起的错误/事件并写日志，方便诊断"为什么看不到" */
+static void x_drain(const char *tag)
+{
+    uint8_t b[64];
+    ssize_t n;
+    int i;
+
+    fcntl(g_fd, F_SETFL, fcntl(g_fd, F_GETFL, 0) | O_NONBLOCK);
+    while ((n = read(g_fd, b, sizeof b)) > 0) {
+        if (b[0] == 0) {
+            fprintf(stderr, "lutshow: %s X error code=%d\n", tag, b[1]);
+        }
+    }
 }
 
 static void x_unmap(uint32_t win)
@@ -452,6 +487,9 @@ int main(int argc, char **argv)
     if (x_connect(&scr) != 0) return 1;
     if (probe) { close(g_fd); return 0; }
 
+    fprintf(stderr, "lutshow: screen %dx%d root=0x%x base=0x%x\n",
+            scr.width, scr.height, scr.root, g_id_base);
+
     {
         int W = scr.width > 0 ? scr.width : 480;
         int H = scr.height > 0 ? scr.height : 800;
@@ -472,16 +510,15 @@ int main(int argc, char **argv)
             c[3] = x_color(&scr, 230, 200, 40);   /* 左 = 黄 */
             win = x_window(&scr, 0, 0, W, H, c[0]);
             if (!win) return 1;
-            gc = x_gc(win, scr.white);
-            x_rect(win, gc, 0, 0, W, th);                 /* 上 */
-            gc = x_gc(win, c[1]);
-            x_rect(win, gc, W - th, 0, th, H);            /* 右 */
-            gc = x_gc(win, c[2]);
-            x_rect(win, gc, 0, H - th, W, th);            /* 下 */
-            gc = x_gc(win, c[3]);
-            x_rect(win, gc, 0, 0, th, H);                 /* 左 */
-            x_flush();
-            sleep((unsigned)(secs > 0 ? secs : 8));
+            x_rect(win, x_gc(win, c[1], 1), W - th, 0, th, H);   /* 右 = 绿 */
+            x_rect(win, x_gc(win, c[2], 2), 0, H - th, W, th);   /* 下 = 蓝 */
+            x_rect(win, x_gc(win, c[3], 3), 0, 0, th, H);        /* 左 = 黄 */
+            for (i = 0; i < (secs > 0 ? secs : 8); i++) {
+                x_raise(win);
+                x_flush();
+                x_drain("calib");
+                sleep(1);
+            }
             x_unmap(win);
             x_flush();
             close(g_fd);
@@ -497,7 +534,7 @@ int main(int argc, char **argv)
 
         if (text && !bar_only && *text) {
             fg = x_color(&scr, 255, 255, 255);
-            gc = x_gc(win, fg);
+            gc = x_gc(win, fg, 0);
             if (gc) {
                 int tx = 6, ty = 4;
                 if (rot == 90)       { tx = 4; ty = 6; }
@@ -510,7 +547,12 @@ int main(int argc, char **argv)
 
         if (secs < 1)  secs = 1;
         if (secs > 30) secs = 30;
-        sleep((unsigned)secs);
+        for (i = 0; i < secs; i++) {
+            x_raise(win);
+            x_flush();
+            x_drain("show");
+            sleep(1);
+        }
         x_unmap(win);
         x_flush();
     }
