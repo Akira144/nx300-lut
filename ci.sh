@@ -104,6 +104,11 @@ echo
 echo "== 本机编译 + 冒烟测试"
 ( cd "$ROOT/$DIR" && make )
 
+echo
+echo "== 本机编译 lutshow（只做语法检查）"
+( cd "$ROOT/$DIR" && cc -O2 -Wall -o /tmp/lutshow src/lutshow.c )
+file /tmp/lutshow
+
 if [ "$SMOKE" = "1" ]; then
     echo
     echo "== 冒烟测试"
@@ -180,6 +185,13 @@ build_neon() {
         -L"$ROOT/arm-jpeg-hf/lib" -ljpeg )
     file "$ROOT/$DIR/lutd-hf.arm"
     ls -l "$ROOT/$DIR/lutd-hf.arm"
+
+    echo
+    echo "== 编译 lutshow-hf.arm（屏幕浮层，零依赖）"
+    ( cd "$ROOT/$DIR" && arm-linux-gnueabihf-gcc -O2 -Wall -static \
+        -o lutshow-hf.arm src/lutshow.c )
+    file "$ROOT/$DIR/lutshow-hf.arm"
+    ls -l "$ROOT/$DIR/lutshow-hf.arm"
 }
 
 echo
