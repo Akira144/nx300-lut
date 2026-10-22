@@ -402,6 +402,8 @@ static int g_in_fd[8];
 static int g_in_n = 0;
 static int g_hotkey = 0;
 static int g_probe_keys = 0;
+static int g_combo = 1;      /* Delete + 转盘 组合切换 */
+static int g_del_down = 0;   /* 删除键当前是否按住 */
 
 static void input_open(void)
 {
@@ -418,12 +420,13 @@ static void input_open(void)
            g_in_n, g_hotkey, g_probe_keys);
 }
 
-/* 切到目录里下一个 .cube，并写进 active 保存选择 */
-static void hotkey_next(void)
+/* 切到下一个/上一个 .cube，写进 active 保存选择，并在屏幕上显示名字 */
+static void hotkey_step(int dir)
 {
     DIR *d;
     struct dirent *e;
     char names[32][256];
+    char label[64];
     int n = 0, i, j, cur = -1, next;
     const char *base;
 
@@ -455,7 +458,7 @@ static void hotkey_next(void)
     for (i = 0; i < n; i++)
         if (!strcasecmp(names[i], base)) { cur = i; break; }
 
-    next = (cur + 1) % n;
+    next = (cur + (dir >= 0 ? 1 : -1) + n) % n;
 
     {
         char ap[PATH_BIG];
@@ -468,6 +471,14 @@ static void hotkey_next(void)
     }
     lut_maybe_reload();
     logmsg("hotkey: %s (%d/%d)", names[next], next + 1, n);
+
+    /* 屏幕上显示当前 LUT 名字（去掉 .cube 后缀） */
+    snprintf(label, sizeof label, "%s", names[next]);
+    {
+        size_t l = strlen(label);
+        if (l > 5 && !strcasecmp(label + l - 5, ".cube")) label[l - 5] = 0;
+    }
+    overlay(label, 3, 20, 110, 200);
     led_blink(next + 1);                      /* 闪 N 下 = 第 N 个 */
 }
 
@@ -485,9 +496,19 @@ static void input_handle(void)
                 struct input_event ev;
                 memcpy(&ev, buf + off, sizeof ev);
                 off += sizeof ev;
-                if (ev.type != EV_KEY || ev.value != 1) continue;
-                if (g_probe_keys) logmsg("key: code=%d", ev.code);
-                if (g_hotkey && ev.code == g_hotkey) hotkey_next();
+                if (ev.type != EV_KEY) continue;
+                if (g_probe_keys) logmsg("key: code=%d value=%d", ev.code, ev.value);
+
+                if (ev.code == 83) {                 /* Delete：只记状态 */
+                    g_del_down = (ev.value != 0);
+                    continue;
+                }
+                if (ev.value != 1) continue;          /* 只处理按下 */
+
+                if (g_combo && g_del_down && (ev.code == 177 || ev.code == 178))
+                    hotkey_step(ev.code == 177 ? 1 : -1);
+                else if (g_hotkey && ev.code == g_hotkey)
+                    hotkey_step(1);
             }
         }
     }
@@ -982,6 +1003,7 @@ typedef struct {
     int hotkey;
     int probe_keys;
     int strength;
+    int combo;
     int srw;
     int quality;
     long min_bytes;
@@ -1017,6 +1039,7 @@ static void cfg_defaults(Cfg *c)
     c->hotkey = 0;
     c->probe_keys = 0;
     c->strength = 100;
+    c->combo = 1;
     c->srw = 1;
     c->quality = 92;
     c->min_bytes = 100000;
@@ -1060,6 +1083,7 @@ static void cfg_load(Cfg *c, const char *path)
         else if (!strcasecmp(p, "LED")) snprintf(c->led, sizeof c->led, "%s", eq);
         else if (!strcasecmp(p, "HOTKEY")) c->hotkey = atoi(eq);
         else if (!strcasecmp(p, "PROBE_KEYS")) c->probe_keys = atoi(eq) != 0;
+        else if (!strcasecmp(p, "COMBO")) c->combo = atoi(eq) != 0;
         else if (!strcasecmp(p, "LUT_STRENGTH")) {
             c->strength = atoi(eq);
             if (c->strength < 0) c->strength = 0;
@@ -1451,6 +1475,7 @@ static int daemon_run(Cfg *cfg)
     g_hotkey = cfg->hotkey;
     g_probe_keys = cfg->probe_keys;
     g_strength = cfg->strength;
+    g_combo = cfg->combo;
     input_open();
     if (lut_init() != 0) {
         logmsg("cannot load any LUT (tried %s/active and %s)", g_lut_dir, cfg->lut);
