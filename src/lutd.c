@@ -235,6 +235,83 @@ static inline int lerp8(int a, int b, int f)
     return a + (((b - a) * f) >> 8);
 }
 
+/* ------------------------------------------------------------------ */
+/* active LUT switching                                                */
+/*                                                                     */
+/* Put a file named "active" next to the LUTs, containing one file     */
+/* name (or an absolute path).  It is re-checked before every photo,   */
+/* so switching does not need a rebuild - only a fresh boot.           */
+/* ------------------------------------------------------------------ */
+
+static Lut g_lut;
+static char g_lut_default[PATH_BIG];   /* cfg->lut                    */
+static char g_lut_dir[PATH_BIG];       /* dirname(cfg->lut)           */
+static char g_lut_cur[PATH_BIG];       /* path currently loaded       */
+static time_t g_lut_mtime;
+static ino_t g_lut_ino;
+
+static void lut_choose_path(char *out, size_t n)
+{
+    char active[PATH_BIG];
+    FILE *f;
+
+    snprintf(active, sizeof active, "%s/active", g_lut_dir);
+    if ((f = fopen(active, "r"))) {
+        char line[512];
+        if (fgets(line, sizeof line, f)) {
+            char *p = trim(line);
+            size_t l = strlen(p);
+            while (l && (p[l - 1] == '\n' || p[l - 1] == '\r' || p[l - 1] == ' '))
+                p[--l] = 0;
+            if (*p) {
+                if (*p == '/') snprintf(out, n, "%s", p);
+                else           snprintf(out, n, "%s/%s", g_lut_dir, p);
+                fclose(f);
+                return;
+            }
+        }
+        fclose(f);
+    }
+    snprintf(out, n, "%s", g_lut_default);
+}
+
+/* set default path + the directory where "active" lives */
+static void lut_set_paths(const char *lutpath)
+{
+    char *slash;
+
+    snprintf(g_lut_default, sizeof g_lut_default, "%s", lutpath);
+    snprintf(g_lut_dir, sizeof g_lut_dir, "%s", lutpath);
+    slash = strrchr(g_lut_dir, '/');
+    if (slash) *slash = 0;
+    else       snprintf(g_lut_dir, sizeof g_lut_dir, ".");
+}
+
+/* reload only when the chosen file changed; cheap (one stat per photo) */
+static int lut_maybe_reload(void)
+{
+    char path[PATH_BIG];
+    struct stat st;
+    Lut tmp;
+
+    lut_choose_path(path, sizeof path);
+    if (stat(path, &st) != 0) return -1;
+    if (g_lut.n3 && st.st_mtime == g_lut_mtime && st.st_ino == g_lut_ino) return 0;
+
+    memset(&tmp, 0, sizeof tmp);
+    if (lut_load(path, &tmp) != 0) return -1;
+    lut_prepare(&tmp);
+
+    free(g_lut.t1);
+    free(g_lut.t3);
+    g_lut = tmp;
+    g_lut_mtime = st.st_mtime;
+    g_lut_ino = st.st_ino;
+    snprintf(g_lut_cur, sizeof g_lut_cur, "%s", path);
+    logmsg("lut: using %s (3D %d^3, 1D %d)", path, g_lut.n3, g_lut.n1);
+    return 0;
+}
+
 static void apply_row(const Lut *L, unsigned char *row, int w)
 {
     const int n = L->n3;
@@ -359,7 +436,163 @@ typedef struct {
     int copy_app2;    /* keep APP2 (Samsung/MPF/ICC)                     */
     int no_jfif;      /* do not emit the JFIF APP0 header                */
     int copy_dri;     /* reuse the source's restart interval             */
+    int regrade_thumb;/* re-LUT the EXIF thumbnail in place              */
 } Enc;
+
+/* ------------------------------------------------------------------ */
+/* EXIF thumbnail: regrade the tiny embedded JPEG in place, so Windows  */
+/* Explorer and the camera index show the graded colours too.           */
+/* We never move anything: the new thumbnail must fit into the old      */
+/* slot, so all EXIF offsets stay valid.                                */
+/* ------------------------------------------------------------------ */
+
+static jmp_buf g_tjb;
+
+static void thumb_error_exit(j_common_ptr ci) { (void)ci; longjmp(g_tjb, 1); }
+static void thumb_silent(j_common_ptr ci, int level) { (void)ci; (void)level; }
+
+static unsigned t16(const unsigned char *p, int le)
+{
+    return le ? (unsigned)(p[0] | (p[1] << 8)) : (unsigned)((p[0] << 8) | p[1]);
+}
+
+static unsigned long t32(const unsigned char *p, int le)
+{
+    if (le)
+        return (unsigned long)p[0] | ((unsigned long)p[1] << 8) |
+               ((unsigned long)p[2] << 16) | ((unsigned long)p[3] << 24);
+    return ((unsigned long)p[0] << 24) | ((unsigned long)p[1] << 16) |
+           ((unsigned long)p[2] << 8) | (unsigned long)p[3];
+}
+
+static void tw16(unsigned char *p, unsigned v, int le)
+{
+    if (le) { p[0] = (unsigned char)v; p[1] = (unsigned char)(v >> 8); }
+    else    { p[0] = (unsigned char)(v >> 8); p[1] = (unsigned char)v; }
+}
+
+static void tw32(unsigned char *p, unsigned long v, int le)
+{
+    if (le) {
+        p[0] = (unsigned char)v; p[1] = (unsigned char)(v >> 8);
+        p[2] = (unsigned char)(v >> 16); p[3] = (unsigned char)(v >> 24);
+    } else {
+        p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16);
+        p[2] = (unsigned char)(v >> 8);  p[3] = (unsigned char)v;
+    }
+}
+
+static int thumb_regrade(unsigned char *app1, int app1_len, const Lut *L)
+{
+    struct jpeg_decompress_struct d;
+    struct jpeg_compress_struct c;
+    struct jpeg_error_mgr jd, jc;
+    unsigned char *rgb = NULL;
+    unsigned char *jpg = NULL;
+    unsigned long jlen = 0;
+    volatile int dok = 0, cok = 0, rc = -1;
+    unsigned char *tiff, *thumb;
+    unsigned long ifd0, n0, ifd1, n1, toff = 0, tlen = 0, i;
+    int le, w, h, y;
+
+    if (app1_len < 24 || memcmp(app1, "Exif\0\0", 6) != 0) return -1;
+    tiff = app1 + 6;
+    le = (tiff[0] == 'I');
+
+    ifd0 = t32(tiff + 4, le);
+    if (ifd0 + 2 > (unsigned long)(app1_len - 6)) return -1;
+    n0 = t16(tiff + ifd0, le);
+    if (ifd0 + 2 + n0 * 12 + 4 > (unsigned long)(app1_len - 6)) return -1;
+    ifd1 = t32(tiff + ifd0 + 2 + n0 * 12, le);
+    if (!ifd1 || ifd1 + 2 > (unsigned long)(app1_len - 6)) return -1;
+    n1 = t16(tiff + ifd1, le);
+    if (ifd1 + 2 + n1 * 12 > (unsigned long)(app1_len - 6)) return -1;
+
+    for (i = 0; i < n1; i++) {
+        unsigned long e = ifd1 + 2 + i * 12;
+        unsigned tag = t16(tiff + e, le);
+        unsigned typ = t16(tiff + e + 2, le);
+        if (tag == 0x0201 && (typ == 4 || typ == 3))
+            toff = (typ == 3) ? t16(tiff + e + 8, le) : t32(tiff + e + 8, le);
+        if (tag == 0x0202 && (typ == 4 || typ == 3))
+            tlen = (typ == 3) ? t16(tiff + e + 8, le) : t32(tiff + e + 8, le);
+    }
+    if (!toff || tlen < 200) return -1;
+    if (toff + tlen > (unsigned long)(app1_len - 6)) return -1;
+    thumb = tiff + toff;
+    if (thumb[0] != 0xFF || thumb[1] != 0xD8) return -1;
+
+    memset(&d, 0, sizeof d);
+    memset(&c, 0, sizeof c);
+    d.err = jpeg_std_error(&jd);
+    jd.error_exit = thumb_error_exit;
+    jd.emit_message = thumb_silent;
+    c.err = jpeg_std_error(&jc);
+    jc.error_exit = thumb_error_exit;
+    jc.emit_message = thumb_silent;
+
+    if (setjmp(g_tjb)) { rc = -3; goto done; }
+
+    jpeg_create_decompress(&d);
+    dok = 1;
+    jpeg_mem_src(&d, thumb, tlen);
+    jpeg_read_header(&d, TRUE);
+    d.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&d);
+
+    w = (int)d.output_width;
+    h = (int)d.output_height;
+    if (w < 8 || h < 8 || w > 1200 || h > 1200) { rc = -2; goto done; }
+    if (!(rgb = malloc((size_t)w * (size_t)h * 3))) { rc = -1; goto done; }
+
+    for (y = 0; y < h; y++) {
+        JSAMPROW rp = rgb + (size_t)y * (size_t)w * 3;
+        jpeg_read_scanlines(&d, &rp, 1);
+        apply_row(L, rp, w);
+    }
+    jpeg_finish_decompress(&d);
+
+    jpeg_create_compress(&c);
+    cok = 1;
+    jpeg_mem_dest(&c, &jpg, &jlen);
+    c.image_width = (JDIMENSION)w;
+    c.image_height = (JDIMENSION)h;
+    c.input_components = 3;
+    c.in_color_space = JCS_RGB;
+    jpeg_set_defaults(&c);
+    jpeg_set_colorspace(&c, JCS_YCbCr);
+    jpeg_set_quality(&c, 78, TRUE);
+    c.write_JFIF_header = FALSE;
+    c.write_Adobe_marker = FALSE;
+    jpeg_start_compress(&c, TRUE);
+    for (y = 0; y < h; y++) {
+        JSAMPROW wp = rgb + (size_t)y * (size_t)w * 3;
+        jpeg_write_scanlines(&c, &wp, 1);
+    }
+    jpeg_finish_compress(&c);
+
+    if (!jpg || jlen == 0 || jlen > tlen) { rc = -2; goto done; }
+
+    memcpy(thumb, jpg, jlen);
+    memset(thumb + jlen, 0, (size_t)(tlen - jlen));
+
+    for (i = 0; i < n1; i++) {
+        unsigned long e = ifd1 + 2 + i * 12;
+        unsigned tag = t16(tiff + e, le);
+        unsigned typ = t16(tiff + e + 2, le);
+        if (tag != 0x0202) continue;
+        if (typ == 3) tw16(tiff + e + 8, (unsigned)jlen, le);
+        else          tw32(tiff + e + 8, jlen, le);
+    }
+    rc = 0;
+
+done:
+    if (cok) jpeg_destroy_compress(&c);
+    if (dok) jpeg_destroy_decompress(&d);
+    free(rgb);
+    free(jpg);
+    return rc;
+}
 
 static int apply_jpeg(const char *in, const char *out, const Lut *L,
                       const Enc *e, int orientation, const char *dt)
@@ -432,8 +665,20 @@ static int apply_jpeg(const char *in, const char *out, const Lut *L,
 
     if (e->copy_app1 || e->copy_app2) {
         jpeg_saved_marker_ptr m;
-        for (m = d.marker_list; m; m = m->next)
+        for (m = d.marker_list; m; m = m->next) {
+            if (e->regrade_thumb && m->marker == JPEG_APP0 + 1 && m->data_length > 64) {
+                unsigned char *buf = malloc(m->data_length);
+                if (buf) {
+                    memcpy(buf, m->data, m->data_length);
+                    if (thumb_regrade(buf, (int)m->data_length, L) == 0)
+                        logmsg("exif thumbnail regraded");
+                    jpeg_write_marker(&c, m->marker, buf, m->data_length);
+                    free(buf);
+                    continue;
+                }
+            }
             jpeg_write_marker(&c, m->marker, m->data, m->data_length);
+        }
     }
 
     if (orientation >= 1 && orientation <= 8) {
@@ -542,6 +787,7 @@ typedef struct {
     int copy_app2;
     int no_jfif;
     int copy_dri;
+    int thumb;
     int srw;
     int quality;
     long min_bytes;
@@ -554,6 +800,7 @@ static void enc_from_cfg(const Cfg *cfg, Enc *e)
     e->copy_app2 = cfg->copy_app2;
     e->no_jfif   = cfg->no_jfif;
     e->copy_dri  = cfg->copy_dri;
+    e->regrade_thumb = cfg->thumb;
 }
 
 static void cfg_defaults(Cfg *c)
@@ -570,6 +817,7 @@ static void cfg_defaults(Cfg *c)
     c->copy_app2 = 1;
     c->no_jfif = 1;
     c->copy_dri = 1;
+    c->thumb = 1;
     c->srw = 1;
     c->quality = 92;
     c->min_bytes = 100000;
@@ -608,6 +856,7 @@ static void cfg_load(Cfg *c, const char *path)
         else if (!strcasecmp(p, "COPY_APP2")) c->copy_app2 = atoi(eq) != 0;
         else if (!strcasecmp(p, "NO_JFIF")) c->no_jfif = atoi(eq) != 0;
         else if (!strcasecmp(p, "COPY_DRI")) c->copy_dri = atoi(eq) != 0;
+        else if (!strcasecmp(p, "THUMB")) c->thumb = atoi(eq) != 0;
         else if (!strcasecmp(p, "SRW")) c->srw = atoi(eq) != 0;
         else if (!strcasecmp(p, "QUALITY")) c->quality = atoi(eq);
         else if (!strcasecmp(p, "MIN_BYTES")) c->min_bytes = atol(eq);
@@ -656,7 +905,7 @@ static int guard_hit(const char *p)
 /* ------------------------------------------------------------------ */
 /* one file                                                            */
 
-static void handle_file(const Cfg *cfg, const Lut *L, const char *dir, const char *name)
+static void handle_file(const Cfg *cfg, const char *dir, const char *name)
 {
     char in[PATH_BIG], tmp[PATH_BIG], out[PATH_BIG], orig[PATH_BIG];
     struct stat st;
@@ -690,7 +939,8 @@ static void handle_file(const Cfg *cfg, const Lut *L, const char *dir, const cha
     {
         Enc e;
         enc_from_cfg(cfg, &e);
-        rc = apply_jpeg(in, out, L, &e, 0, NULL);
+        lut_maybe_reload();
+        rc = apply_jpeg(in, out, &g_lut, &e, 0, NULL);
     }
     if (rc != 0) {
         logmsg("failed rc=%d: %s", rc, in);
@@ -871,7 +1121,7 @@ static int srw_extract(const char *path, long off, long len, const char *out)
     return left == 0 ? 0 : -1;
 }
 
-static void handle_srw(const Cfg *cfg, const Lut *L, const char *dir, const char *name)
+static void handle_srw(const Cfg *cfg, const char *dir, const char *name)
 {
     char in[PATH_BIG], sib[PATH_BIG], tmp[PATH_BIG], tmp2[PATH_BIG], out[PATH_BIG];
     char base[256];
@@ -913,7 +1163,8 @@ static void handle_srw(const Cfg *cfg, const Lut *L, const char *dir, const char
     {
         Enc e;
         enc_from_cfg(cfg, &e);
-        rc = apply_jpeg(tmp, tmp2, L, &e,
+        lut_maybe_reload();
+        rc = apply_jpeg(tmp, tmp2, &g_lut, &e,
                         si.orientation, si.datetime[0] ? si.datetime : NULL);
     }
     unlink(tmp);
@@ -977,14 +1228,14 @@ static void watch_tree(int fd, const char *dir, int depth)
 
 static int daemon_run(Cfg *cfg)
 {
-    Lut L;
     int fd;
     struct timespec ts;
 
-    if (lut_load(cfg->lut, &L) != 0) return 1;
-    lut_prepare(&L);
-    logmsg("lut loaded: 3D %d^3, 1D %d, domain %.3f..%.3f",
-           L.n3, L.n1, L.dmin[0], L.dmax[0]);
+    lut_set_paths(cfg->lut);
+    if (lut_maybe_reload() != 0) {
+        logmsg("cannot load any LUT (tried %s/active and %s)", g_lut_dir, cfg->lut);
+        return 1;
+    }
 
     if (cfg->keep_orig) mkdir_p(cfg->origdir);
 
@@ -1023,9 +1274,9 @@ static int daemon_run(Cfg *cfg)
                     }
                 } else if (ev->mask & (IN_CLOSE_WRITE | IN_MOVED_TO)) {
                     if (is_jpeg_name(ev->name))
-                        handle_file(cfg, &L, dir, ev->name);
+                        handle_file(cfg, dir, ev->name);
                     else if (cfg->srw && is_srw_name(ev->name))
-                        handle_srw(cfg, &L, dir, ev->name);
+                        handle_srw(cfg, dir, ev->name);
                 }
             }
             off += (ssize_t)(sizeof(struct inotify_event) + ev->len);
@@ -1066,6 +1317,7 @@ int main(int argc, char **argv)
             e.quality = q;
             e.copy_app1 = 1;
             e.copy_app2 = 1;
+            e.regrade_thumb = 1;
             rc = apply_jpeg(argv[2], argv[3], &L, &e, 0, NULL);
         }
         fprintf(stderr, "lutd: %s\n", rc == 0 ? "ok" : "failed");
@@ -1074,16 +1326,14 @@ int main(int argc, char **argv)
 
     if (argc > 1 && !strcmp(argv[1], "--selftest")) {
         Cfg c;
-        Lut L;
 
         cfg_defaults(&c);
         cfg_load(&c, argc > 2 ? argv[2] : "/mnt/mmc/lut/lutd.conf");
         printf("watch=%s\nlut=%s\nmode=%s\nsrw=%d\n",
                c.watch, c.lut, c.mode, c.srw);
-        if (lut_load(c.lut, &L) != 0) { printf("lut: FAILED\n"); return 1; }
-        lut_prepare(&L);
-        printf("lut: ok, 3D %d^3, 1D %d, domain %.3f..%.3f\n",
-               L.n3, L.n1, L.dmin[0], L.dmax[0]);
+        lut_set_paths(c.lut);
+        if (lut_maybe_reload() != 0) { printf("lut: FAILED\n"); return 1; }
+        printf("lut: ok, 3D %d^3, 1D %d, path %s\n", g_lut.n3, g_lut.n1, g_lut_cur);
         printf("selftest ok\n");
         return 0;
     }
