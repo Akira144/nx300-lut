@@ -318,7 +318,33 @@ static void overlay(const char *text, int secs, int r, int g, int b)
     }
 }
 
-/* reload only when the chosen file changed; cheap (one stat per photo) */static int lut_maybe_reload(void)
+/* LED 状态：处理中常亮，完成熄灭，失败闪三下 */
+static char g_led[192] = "";
+
+static void led_set(int on)
+{
+    FILE *f;
+
+    if (!g_led[0]) return;
+    if (!(f = fopen(g_led, "w"))) return;
+    fputc(on ? '1' : '0', f);
+    fclose(f);
+}
+
+static void led_blink(int n)
+{
+    int i;
+
+    for (i = 0; i < n; i++) {
+        led_set(1);
+        usleep(150000);
+        led_set(0);
+        usleep(150000);
+    }
+}
+
+/* reload only when the chosen file changed; cheap (one stat per photo) */
+static int lut_maybe_reload(void)
 {
     char path[PATH_BIG];
     struct stat st;
@@ -819,6 +845,7 @@ typedef struct {
     int copy_dri;
     int thumb;
     int overlay;
+    char led[192];
     int srw;
     int quality;
     long min_bytes;
@@ -850,6 +877,7 @@ static void cfg_defaults(Cfg *c)
     c->copy_dri = 1;
     c->thumb = 1;
     c->overlay = 1;
+    snprintf(c->led, sizeof c->led, "%s", "/sys/class/leds/card/brightness");
     c->srw = 1;
     c->quality = 92;
     c->min_bytes = 100000;
@@ -890,6 +918,7 @@ static void cfg_load(Cfg *c, const char *path)
         else if (!strcasecmp(p, "COPY_DRI")) c->copy_dri = atoi(eq) != 0;
         else if (!strcasecmp(p, "THUMB")) c->thumb = atoi(eq) != 0;
         else if (!strcasecmp(p, "OVERLAY")) c->overlay = atoi(eq) != 0;
+        else if (!strcasecmp(p, "LED")) snprintf(c->led, sizeof c->led, "%s", eq);
         else if (!strcasecmp(p, "SRW")) c->srw = atoi(eq) != 0;
         else if (!strcasecmp(p, "QUALITY")) c->quality = atoi(eq);
         else if (!strcasecmp(p, "MIN_BYTES")) c->min_bytes = atol(eq);
@@ -970,6 +999,7 @@ static void handle_file(const Cfg *cfg, const char *dir, const char *name)
 
     logmsg("apply %s (%ld bytes) -> %s", in, (long)st.st_size, out);
     overlay("PROCESSING", 30, 210, 150, 30);
+    led_set(1);
     {
         Enc e;
         enc_from_cfg(cfg, &e);
@@ -979,6 +1009,7 @@ static void handle_file(const Cfg *cfg, const char *dir, const char *name)
     if (rc != 0) {
         logmsg("failed rc=%d: %s", rc, in);
         overlay("FAILED", 5, 200, 50, 50);
+        led_blink(3);
         unlink(tmp);
         return;
     }
@@ -1013,6 +1044,7 @@ static void handle_file(const Cfg *cfg, const char *dir, const char *name)
     }
     guard_add(in);
     overlay("DONE", 3, 40, 190, 90);
+    led_set(0);
     logmsg("done %s", in);
 }
 
@@ -1269,6 +1301,7 @@ static int daemon_run(Cfg *cfg)
 
     lut_set_paths(cfg->lut);
     g_overlay_on = cfg->overlay;
+    snprintf(g_led, sizeof g_led, "%s", cfg->led);
     if (lut_maybe_reload() != 0) {
         logmsg("cannot load any LUT (tried %s/active and %s)", g_lut_dir, cfg->lut);
         return 1;
