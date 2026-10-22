@@ -1,16 +1,23 @@
 /*
- * lutshow - 在 NX300 屏幕上显示一条状态条，不依赖任何 X11 库。
+ * lutshow - 在 NX300 屏幕上显示状态条 / 文字，零依赖。
  *
- * 直接实现 X11 协议（unix socket /tmp/.X11-unix/X0），静态编译，
- * 因此不受相机上老 glibc 的影响（相机是 glibc 2.x，工具链是 2.39）。
+ * 不使用任何 X11 库，也不使用服务端字体：文字用内置 5x7 点阵，
+ * 静态编译，可运行在相机那套老 glibc 上。
  *
  * 用法:
- *   lutshow "LUT 2/5 portra.cube" 3
- *   lutshow --probe                     # 只测试能否连上 X（0=能，1=不能）
- *   lutshow --bar 2 200,40,40           # 只画色条（红），2 秒
+ *   lutshow "PROCESSING 3/5" 20
+ *   lutshow --calib 8                   # 校准：四条边各涂一色
+ *   lutshow --probe                     # 只测能否连上 X
  *
- * 选项:  --color R,G,B   背景色，默认 30,160,90（绿）
- *        --bg           不画文字，只画色条
+ * 选项:
+ *   --edge bottom|top|left|right   贴哪条边（默认读配置文件）
+ *   --rot 0|90|180|270             文字旋转（默认读配置文件）
+ *   --color R,G,B                  背景色
+ *   --bg                           只画色条不画字
+ *
+ * 配置文件: /mnt/mmc/lut/overlay.conf
+ *   edge=bottom
+ *   rot=0
  */
 
 #define _GNU_SOURCE
@@ -25,14 +32,15 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+/* ------------------------------------------------------------------ */
+/* X11 基础                                                            */
+
 static int g_fd = -1;
 static uint32_t g_id_base = 0;
-static uint8_t g_req[4096];
+static uint8_t g_req[16000];
 static int g_len = 0;
 
-/* ---------------------------------------------------------------- */
-
-static void p8(unsigned v)  { g_req[g_len++] = (uint8_t)v; }
+static void p8(unsigned v) { g_req[g_len++] = (uint8_t)v; }
 
 static void p16(unsigned v)
 {
@@ -54,7 +62,6 @@ static void patch16(int at, unsigned v)
     g_req[at + 1] = (uint8_t)((v >> 8) & 0xFF);
 }
 
-/* X11 请求头固定 4 字节: opcode, data, length(4字节单位, 含自身) */
 static void begin(int opcode, int data)
 {
     g_len = 0;
@@ -102,9 +109,6 @@ static int rd_all(void *buf, size_t n)
 
 static int send_req(void) { return wr_all(g_req, (size_t)g_len); }
 
-/* ---------------------------------------------------------------- */
-/* MIT-MAGIC-COOKIE-1 from $HOME/.Xauthority                         */
-
 static unsigned rd16(const uint8_t *p) { return (unsigned)p[0] | ((unsigned)p[1] << 8); }
 
 static int read_cookie(uint8_t *out, int *outlen)
@@ -150,11 +154,9 @@ out:
     return -1;
 }
 
-/* ---------------------------------------------------------------- */
-
 typedef struct {
     uint32_t root, cmap, white, black;
-    int width, height, depth;
+    int width, height;
 } Screen;
 
 static int x_connect(Screen *scr)
@@ -162,7 +164,6 @@ static int x_connect(Screen *scr)
     struct sockaddr_un sa;
     uint8_t buf[4096];
     uint8_t cookie[64];
-    uint32_t id_base = 0;
     int clen = 0;
     unsigned nfmt, nscr, addlen, vendor_len;
     size_t off;
@@ -176,10 +177,7 @@ static int x_connect(Screen *scr)
     if (read_cookie(cookie, &clen) != 0) clen = 0;
 
     g_len = 0;
-    p8(0x6C);                      /* little endian */
-    p8(0);
-    p16(11);
-    p16(0);
+    p8(0x6C); p8(0); p16(11); p16(0);
     p16(clen ? 18u : 0u);
     p16((unsigned)clen);
     p8(0); p8(0);
@@ -201,10 +199,8 @@ static int x_connect(Screen *scr)
     if (rd_all(buf, (size_t)addlen * 4) != 0) goto fail;
     if (addlen * 4u < 40) goto fail;
 
-    id_base = (uint32_t)buf[4] | ((uint32_t)buf[5] << 8) |
-              ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24);
-    g_id_base = id_base;
-
+    g_id_base = (uint32_t)buf[4] | ((uint32_t)buf[5] << 8) |
+                ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24);
     vendor_len = (unsigned)buf[16] | ((unsigned)buf[17] << 8);
     nscr = buf[20];
     nfmt = buf[21];
@@ -219,12 +215,10 @@ static int x_connect(Screen *scr)
                   ((uint32_t)buf[off + 2] << 16) | ((uint32_t)buf[off + 3] << 24);
     scr->cmap   = (uint32_t)buf[off + 4] | ((uint32_t)buf[off + 5] << 8) |
                   ((uint32_t)buf[off + 6] << 16) | ((uint32_t)buf[off + 7] << 24);
-    scr->white  = (uint32_t)buf[off + 8] | ((uint32_t)buf[off + 9] << 8) |
-                  ((uint32_t)buf[off + 10] << 16) | ((uint32_t)buf[off + 11] << 24);
+    scr->white  = (uint32_t)buf[off + 8];
     scr->black  = (uint32_t)buf[off + 12];
     scr->width  = (int)((unsigned)buf[off + 20] | ((unsigned)buf[off + 21] << 8));
     scr->height = (int)((unsigned)buf[off + 22] | ((unsigned)buf[off + 23] << 8));
-    scr->depth  = buf[off + 38];
     return 0;
 
 fail:
@@ -233,17 +227,13 @@ fail:
     return -1;
 }
 
-/* ---------------------------------------------------------------- */
-
-static unsigned long x_alloc_color(const Screen *scr, int r, int g, int b)
+static unsigned long x_color(const Screen *s, int r, int g, int b)
 {
     uint8_t rep[32];
 
     begin(84, 0);
-    p32(scr->cmap);
-    p16((unsigned)(r * 257));
-    p16((unsigned)(g * 257));
-    p16((unsigned)(b * 257));
+    p32(s->cmap);
+    p16((unsigned)(r * 257)); p16((unsigned)(g * 257)); p16((unsigned)(b * 257));
     p16(0);
     end();
     if (send_req() != 0 || rd_all(rep, 32) != 0) return 0;
@@ -252,33 +242,24 @@ static unsigned long x_alloc_color(const Screen *scr, int r, int g, int b)
            ((unsigned long)rep[14] << 16) | ((unsigned long)rep[15] << 24);
 }
 
-static uint32_t x_window(const Screen *scr, int x, int y, int w, int h, unsigned long bg)
+static uint32_t x_window(const Screen *s, int x, int y, int w, int h, unsigned long bg)
 {
     uint32_t win = g_id_base | 0x00000100u;
 
-    begin(1, 0);                   /* CreateWindow, depth 0 = copy from parent */
-    p32(win);
-    p32(scr->root);
-    p16((unsigned)x);
-    p16((unsigned)y);
-    p16((unsigned)w);
-    p16((unsigned)h);
-    p16(0);                        /* border width */
-    p16(1);                        /* class: InputOutput */
-    p32(0);                        /* visual: copy from parent */
-    p32(2);                        /* CWBackPixel */
-    p32((uint32_t)bg);
+    begin(1, 0);
+    p32(win); p32(s->root);
+    p16((unsigned)x); p16((unsigned)y); p16((unsigned)w); p16((unsigned)h);
+    p16(0); p16(1); p32(0);
+    p32(2); p32((uint32_t)bg);
     end();
     if (send_req() != 0) return 0;
 
-    begin(2, 0);                   /* ChangeWindowAttributes */
-    p32(win);
-    p32(512);                      /* CWOverrideRedirect */
-    p32(1);
+    begin(2, 0);
+    p32(win); p32(512); p32(1);
     end();
     if (send_req() != 0) return 0;
 
-    begin(8, 0);                   /* MapWindow */
+    begin(8, 0);
     p32(win);
     end();
     if (send_req() != 0) return 0;
@@ -286,49 +267,22 @@ static uint32_t x_window(const Screen *scr, int x, int y, int w, int h, unsigned
     return win;
 }
 
-static uint32_t x_gc(uint32_t win, unsigned long fg, uint32_t font)
+static uint32_t x_gc(uint32_t win, unsigned long fg)
 {
     uint32_t gc = g_id_base | 0x00000200u;
 
-    begin(55, 0);                  /* CreateGC */
-    p32(gc);
-    p32(win);
-    p32(font ? (4u | 16384u) : 4u);   /* GCForeground | GCFont */
-    p32((uint32_t)fg);
-    if (font) p32(font);
+    begin(55, 0);
+    p32(gc); p32(win); p32(4); p32((uint32_t)fg);
     end();
     if (send_req() != 0) return 0;
     return gc;
 }
 
-static uint32_t x_font(const char *name)
+static void x_rect(uint32_t win, uint32_t gc, int x, int y, int w, int h)
 {
-    uint32_t fid = g_id_base | 0x00000300u;
-    size_t n = strlen(name);
-
-    begin(45, 0);                  /* OpenFont */
-    p32(fid);
-    p16((unsigned)n);
-    p16(0);
-    memcpy(g_req + g_len, name, n);
-    g_len += (int)n;
-    end();
-    if (send_req() != 0) return 0;
-    return fid;
-}
-
-static void x_text(uint32_t win, uint32_t gc, int x, int y, const char *s)
-{
-    size_t n = strlen(s);
-
-    if (n > 250) n = 250;
-    begin(76, (int)n);             /* ImageText8: byte1 = 字符串长度 */
-    p32(win);
-    p32(gc);
-    p16((unsigned)x);
-    p16((unsigned)y);
-    memcpy(g_req + g_len, s, n);
-    g_len += (int)n;
+    begin(70, 0);
+    p32(win); p32(gc);
+    p16((unsigned)x); p16((unsigned)y); p16((unsigned)w); p16((unsigned)h);
     end();
     send_req();
 }
@@ -348,20 +302,142 @@ static void x_flush(void)
     send_req();
 }
 
-/* ---------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/* 内置 5x7 点阵字库（只用到等宽大写字母、数字和几个符号）              */
+
+#define G(a,b,c,d,e,f,g) a b c d e f g
+
+static const char *glyph(char ch)
+{
+    static const char *F[128] = {
+        ['A'] = G(".###.","#...#","#...#","#####","#...#","#...#","#...#"),
+        ['B'] = G("####.","#...#","#...#","####.","#...#","#...#","####."),
+        ['C'] = G(".###.","#...#","#....","#....","#....","#...#",".###."),
+        ['D'] = G("####.","#...#","#...#","#...#","#...#","#...#","####."),
+        ['E'] = G("#####","#....","#....","####.","#....","#....","#####"),
+        ['F'] = G("#####","#....","#....","####.","#....","#....","#...."),
+        ['G'] = G(".###.","#...#","#....","#.###","#...#","#...#",".####"),
+        ['H'] = G("#...#","#...#","#...#","#####","#...#","#...#","#...#"),
+        ['I'] = G("#####","..#..","..#..","..#..","..#..","..#..","#####"),
+        ['J'] = G("..###","...#.","...#.","...#.","...#.","#..#.",".##.."),
+        ['K'] = G("#...#","#..#.","#.#..","##...","#.#..","#..#.","#...#"),
+        ['L'] = G("#....","#....","#....","#....","#....","#....","#####"),
+        ['M'] = G("#...#","##.##","#.#.#","#.#.#","#...#","#...#","#...#"),
+        ['N'] = G("#...#","##..#","#.#.#","#..##","#...#","#...#","#...#"),
+        ['O'] = G(".###.","#...#","#...#","#...#","#...#","#...#",".###."),
+        ['P'] = G("####.","#...#","#...#","####.","#....","#....","#...."),
+        ['Q'] = G(".###.","#...#","#...#","#...#","#.#.#","#..#.",".##.#"),
+        ['R'] = G("####.","#...#","#...#","####.","#.#..","#..#.","#...#"),
+        ['S'] = G(".####","#....","#....",".###.","....#","....#","####."),
+        ['T'] = G("#####","..#..","..#..","..#..","..#..","..#..","..#.."),
+        ['U'] = G("#...#","#...#","#...#","#...#","#...#","#...#",".###."),
+        ['V'] = G("#...#","#...#","#...#","#...#","#...#",".#.#.","..#.."),
+        ['W'] = G("#...#","#...#","#...#","#.#.#","#.#.#","##.##","#...#"),
+        ['X'] = G("#...#","#...#",".#.#.","..#..",".#.#.","#...#","#...#"),
+        ['Y'] = G("#...#","#...#",".#.#.","..#..","..#..","..#..","..#.."),
+        ['Z'] = G("#####","....#","...#.","..#..",".#...","#....","#####"),
+        ['0'] = G(".###.","#...#","#..##","#.#.#","##..#","#...#",".###."),
+        ['1'] = G("..#..",".##..","..#..","..#..","..#..","..#..","#####"),
+        ['2'] = G(".###.","#...#","....#","...#.","..#..",".#...","#####"),
+        ['3'] = G("#####","...#.","..#..","...#.","....#","#...#",".###."),
+        ['4'] = G("...#.","..##.",".#.#.","#..#.","#####","...#.","...#."),
+        ['5'] = G("#####","#....","####.","....#","....#","#...#",".###."),
+        ['6'] = G("..##.",".#...","#....","####.","#...#","#...#",".###."),
+        ['7'] = G("#####","....#","...#.","..#..",".#...",".#...",".#..."),
+        ['8'] = G(".###.","#...#","#...#",".###.","#...#","#...#",".###."),
+        ['9'] = G(".###.","#...#","#...#",".####","....#","...#.",".##.."),
+        [' '] = G(".....",".....",".....",".....",".....",".....","....."),
+        ['.'] = G(".....",".....",".....",".....",".....",".##..",".##.."),
+        ['/'] = G("....#","....#","...#.","..#..",".#...","#....","#...."),
+        ['-'] = G(".....",".....",".....","#####",".....",".....","....."),
+        [':'] = G(".....",".##..",".##..",".....",".##..",".##..","....."),
+    };
+    unsigned c = (unsigned char)ch;
+    if (c >= 'a' && c <= 'z') c -= 32;
+    if (c >= 128 || !F[c]) c = ' ';
+    return F[c];
+}
+
+/* 画一个字符；返回前进量 */
+static int draw_char(uint32_t win, uint32_t gc, int ox, int oy, int scale, int rot, char ch)
+{
+    const char *g = glyph(ch);
+    int c, r, adv = 6 * scale;
+    int W = 5 * scale, H = 7 * scale;
+
+    if (!g) return adv;
+    for (r = 0; r < 7; r++) {
+        for (c = 0; c < 5; c++) {
+            int dx = c * scale, dy = r * scale;
+            int X, Y;
+            if (g[r * 5 + c] != '#') continue;
+            switch (rot) {
+            case 90:  X = ox + (H - dy - scale); Y = oy + dx; break;
+            case 180: X = ox + (W - dx - scale); Y = oy + (H - dy - scale); break;
+            case 270: X = ox + dy;               Y = oy + (W - dx - scale); break;
+            default:  X = ox + dx;               Y = oy + dy; break;
+            }
+            x_rect(win, gc, X, Y, scale, scale);
+        }
+    }
+    return adv;
+}
+
+static void draw_text(uint32_t win, uint32_t gc, int x, int y, int scale, int rot, const char *s)
+{
+    int ox = x, oy = y;
+
+    for (; *s; s++) {
+        int adv = draw_char(win, gc, ox, oy, scale, rot, *s);
+        if (rot == 90 || rot == 270) oy += adv;
+        else if (rot == 180)         ox -= adv;
+        else                         ox += adv;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+
+static int load_conf(const char *path, char *edge, size_t en, int *rot)
+{
+    FILE *f = fopen(path, "r");
+    char line[128];
+
+    if (!f) return -1;
+    while (fgets(line, sizeof line, f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!strncmp(p, "edge=", 5)) {
+            char *v = p + 5, *q = v;
+            while (*q && *q != '\n' && *q != '\r' && *q != ' ') q++;
+            *q = 0;
+            snprintf(edge, en, "%s", v);
+        } else if (!strncmp(p, "rot=", 4)) {
+            *rot = atoi(p + 4);
+        }
+    }
+    fclose(f);
+    return 0;
+}
 
 int main(int argc, char **argv)
 {
     Screen scr;
-    uint32_t win, gc, font;
-    unsigned long bg, fg;
+    uint32_t win, gc;
+    unsigned long bg = 0, fg = 0;
+    char edge[16] = "bottom";
+    int rot = 0, scale = 3, secs = 3, probe = 0, bar_only = 0, calib = 0, i;
+    int r = 30, g = 160, b = 90;
     const char *text = NULL;
-    int secs = 2, r = 30, g = 160, b = 90;
-    int probe = 0, bar_only = 0, i;
+
+    load_conf("/mnt/mmc/lut/overlay.conf", edge, sizeof edge, &rot);
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--probe")) probe = 1;
         else if (!strcmp(argv[i], "--bar")) bar_only = 1;
+        else if (!strcmp(argv[i], "--calib")) calib = 1;
+        else if (!strcmp(argv[i], "--edge") && i + 1 < argc) snprintf(edge, sizeof edge, "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--rot") && i + 1 < argc) rot = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) scale = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--color") && i + 1 < argc) {
             if (sscanf(argv[++i], "%d,%d,%d", &r, &g, &b) != 3) { r = 30; g = 160; b = 90; }
         } else if (argv[i][0] >= '0' && argv[i][0] <= '9' && strlen(argv[i]) <= 2) {
@@ -370,40 +446,75 @@ int main(int argc, char **argv)
             text = argv[i];
         }
     }
+    if (scale < 1) scale = 1;
+    if (scale > 6) scale = 6;
 
     if (x_connect(&scr) != 0) return 1;
     if (probe) { close(g_fd); return 0; }
 
-    bg = x_alloc_color(&scr, r, g, b);
-    if (!bg) bg = scr.black;
-
     {
-        int w = scr.width  > 0 ? scr.width  : 480;
-        int h = (scr.height > 600) ? 64 : 44;
-        int y = (scr.height > h) ? scr.height - h : 0;
+        int W = scr.width > 0 ? scr.width : 480;
+        int H = scr.height > 0 ? scr.height : 800;
+        int th = 22 * scale;
+        int x = 0, y = H - th, w = W, h = th;
 
-        win = x_window(&scr, 0, y, w, h, bg);
-        if (!win) { close(g_fd); return 1; }
+        if (!strcmp(edge, "top"))       { x = 0; y = 0; w = W; h = th; rot = rot ? rot : 0; }
+        else if (!strcmp(edge, "left")) { x = 0; y = 0; w = th; h = H; rot = rot ? rot : 90; }
+        else if (!strcmp(edge, "right")){ x = W - th; y = 0; w = th; h = H; rot = rot ? rot : 90; }
+        else                            { x = 0; y = H - th; w = W; h = th; }
+
+        if (calib) {
+            /* 四条边各一色，用来判断屏幕旋转方向 */
+            unsigned long c[4];
+            c[0] = x_color(&scr, 230, 40, 40);    /* 上 = 红 */
+            c[1] = x_color(&scr, 40, 200, 40);    /* 右 = 绿 */
+            c[2] = x_color(&scr, 60, 90, 230);    /* 下 = 蓝 */
+            c[3] = x_color(&scr, 230, 200, 40);   /* 左 = 黄 */
+            win = x_window(&scr, 0, 0, W, H, c[0]);
+            if (!win) return 1;
+            gc = x_gc(win, scr.white);
+            x_rect(win, gc, 0, 0, W, th);                 /* 上 */
+            gc = x_gc(win, c[1]);
+            x_rect(win, gc, W - th, 0, th, H);            /* 右 */
+            gc = x_gc(win, c[2]);
+            x_rect(win, gc, 0, H - th, W, th);            /* 下 */
+            gc = x_gc(win, c[3]);
+            x_rect(win, gc, 0, 0, th, H);                 /* 左 */
+            x_flush();
+            sleep((unsigned)(secs > 0 ? secs : 8));
+            x_unmap(win);
+            x_flush();
+            close(g_fd);
+            return 0;
+        }
+
+        bg = x_color(&scr, r, g, b);
+        if (!bg) bg = scr.black;
+
+        win = x_window(&scr, x, y, w, h, bg);
+        if (!win) return 1;
+        x_flush();
+
+        if (text && !bar_only && *text) {
+            fg = x_color(&scr, 255, 255, 255);
+            gc = x_gc(win, fg);
+            if (gc) {
+                int tx = 6, ty = 4;
+                if (rot == 90)       { tx = 4; ty = 6; }
+                else if (rot == 270) { tx = w - 4; ty = 6; }
+                else if (rot == 180) { tx = w - 6; ty = h - 4; }
+                draw_text(win, gc, tx, ty, scale, rot, text);
+                x_flush();
+            }
+        }
+
+        if (secs < 1)  secs = 1;
+        if (secs > 30) secs = 30;
+        sleep((unsigned)secs);
+        x_unmap(win);
         x_flush();
     }
 
-    if (text && !bar_only) {
-        fg = x_alloc_color(&scr, 255, 255, 255);
-        if (!fg) fg = scr.white;
-        font = x_font("fixed");
-        gc = x_gc(win, fg, font);
-        if (gc) {
-            x_text(win, gc, 10, 26, text);
-            x_flush();
-        }
-    }
-
-    if (secs < 1)  secs = 1;
-    if (secs > 30) secs = 30;
-    sleep((unsigned)secs);
-
-    x_unmap(win);
-    x_flush();
     close(g_fd);
     return 0;
 }

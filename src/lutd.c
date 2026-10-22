@@ -287,8 +287,38 @@ static void lut_set_paths(const char *lutpath)
     else       snprintf(g_lut_dir, sizeof g_lut_dir, ".");
 }
 
-/* reload only when the chosen file changed; cheap (one stat per photo) */
-static int lut_maybe_reload(void)
+/* 在屏幕上弹一条状态条（异步，失败就算了） */
+static int g_overlay_on = 0;
+
+static void overlay(const char *text, int secs, int r, int g, int b)
+{
+    char bin[PATH_BIG], col[32], sec[8];
+    char *argv[6];
+    pid_t pid;
+
+    if (!g_overlay_on) return;
+    snprintf(bin, sizeof bin, "%s/lutshow-hf.arm", g_lut_dir);
+    if (access(bin, X_OK) != 0) {
+        snprintf(bin, sizeof bin, "%s/lutshow.arm", g_lut_dir);
+        if (access(bin, X_OK) != 0) return;
+    }
+    snprintf(col, sizeof col, "%d,%d,%d", r, g, b);
+    snprintf(sec, sizeof sec, "%d", secs);
+    argv[0] = bin;
+    argv[1] = (char *)text;
+    argv[2] = sec;
+    argv[3] = (char *)"--color";
+    argv[4] = col;
+    argv[5] = NULL;
+
+    pid = fork();
+    if (pid == 0) {
+        execv(bin, argv);
+        _exit(127);
+    }
+}
+
+/* reload only when the chosen file changed; cheap (one stat per photo) */static int lut_maybe_reload(void)
 {
     char path[PATH_BIG];
     struct stat st;
@@ -788,6 +818,7 @@ typedef struct {
     int no_jfif;
     int copy_dri;
     int thumb;
+    int overlay;
     int srw;
     int quality;
     long min_bytes;
@@ -818,6 +849,7 @@ static void cfg_defaults(Cfg *c)
     c->no_jfif = 1;
     c->copy_dri = 1;
     c->thumb = 1;
+    c->overlay = 1;
     c->srw = 1;
     c->quality = 92;
     c->min_bytes = 100000;
@@ -857,6 +889,7 @@ static void cfg_load(Cfg *c, const char *path)
         else if (!strcasecmp(p, "NO_JFIF")) c->no_jfif = atoi(eq) != 0;
         else if (!strcasecmp(p, "COPY_DRI")) c->copy_dri = atoi(eq) != 0;
         else if (!strcasecmp(p, "THUMB")) c->thumb = atoi(eq) != 0;
+        else if (!strcasecmp(p, "OVERLAY")) c->overlay = atoi(eq) != 0;
         else if (!strcasecmp(p, "SRW")) c->srw = atoi(eq) != 0;
         else if (!strcasecmp(p, "QUALITY")) c->quality = atoi(eq);
         else if (!strcasecmp(p, "MIN_BYTES")) c->min_bytes = atol(eq);
@@ -936,6 +969,7 @@ static void handle_file(const Cfg *cfg, const char *dir, const char *name)
     }
 
     logmsg("apply %s (%ld bytes) -> %s", in, (long)st.st_size, out);
+    overlay("PROCESSING", 30, 210, 150, 30);
     {
         Enc e;
         enc_from_cfg(cfg, &e);
@@ -944,6 +978,7 @@ static void handle_file(const Cfg *cfg, const char *dir, const char *name)
     }
     if (rc != 0) {
         logmsg("failed rc=%d: %s", rc, in);
+        overlay("FAILED", 5, 200, 50, 50);
         unlink(tmp);
         return;
     }
@@ -977,6 +1012,7 @@ static void handle_file(const Cfg *cfg, const char *dir, const char *name)
         }
     }
     guard_add(in);
+    overlay("DONE", 3, 40, 190, 90);
     logmsg("done %s", in);
 }
 
@@ -1232,6 +1268,7 @@ static int daemon_run(Cfg *cfg)
     struct timespec ts;
 
     lut_set_paths(cfg->lut);
+    g_overlay_on = cfg->overlay;
     if (lut_maybe_reload() != 0) {
         logmsg("cannot load any LUT (tried %s/active and %s)", g_lut_dir, cfg->lut);
         return 1;
