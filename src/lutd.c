@@ -152,8 +152,8 @@ static int lut_load(const char *path, Lut *L)
         {
             double r, g, b;
             if (sscanf(p, "%lf %lf %lf", &r, &g, &b) != 3) {
-                logmsg("lut: cannot parse line: %s", p);
-                goto bad;
+                logmsg("lut: skip unreadable line (file may be truncated): %s", p);
+                continue;
             }
             if (L->n1 && i1 < (long)L->n1 * 3) {
                 L->t1[i1++] = (unsigned short)((r < 0 ? 0 : r > 1 ? 1 : r) * 65535.0 + 0.5);
@@ -245,6 +245,7 @@ static inline int lerp8(int a, int b, int f)
 /* ------------------------------------------------------------------ */
 
 static Lut g_lut;
+static int g_force_default = 0;
 static char g_lut_default[PATH_BIG];   /* cfg->lut                    */
 static char g_lut_dir[PATH_BIG];       /* dirname(cfg->lut)           */
 static char g_lut_cur[PATH_BIG];       /* path currently loaded       */
@@ -256,6 +257,10 @@ static void lut_choose_path(char *out, size_t n)
     char active[PATH_BIG];
     FILE *f;
 
+    if (g_force_default) {
+        snprintf(out, n, "%s", g_lut_default);
+        return;
+    }
     snprintf(active, sizeof active, "%s/active", g_lut_dir);
     if ((f = fopen(active, "r"))) {
         char line[512];
@@ -290,6 +295,7 @@ static void lut_set_paths(const char *lutpath)
 
 /* 在屏幕上弹一条状态条（异步，失败就算了） */
 static int g_overlay_on = 0;
+static int g_strength = 100;   /* LUT 混合强度，100 = 完全套用 */
 
 static void overlay(const char *text, int secs, int r, int g, int b)
 {
@@ -367,6 +373,24 @@ static int lut_maybe_reload(void)
     snprintf(g_lut_cur, sizeof g_lut_cur, "%s", path);
     logmsg("lut: using %s (3D %d^3, 1D %d)", path, g_lut.n3, g_lut.n1);
     return 0;
+}
+
+/* 先试 active 指定的 LUT；不行就退回 conf 里的默认 LUT；都不行才失败 */
+static int lut_init(void)
+{
+    g_force_default = 0;
+    g_lut_mtime = 0;
+    g_lut_ino = 0;
+    if (lut_maybe_reload() == 0) return 0;
+
+    g_force_default = 1;
+    g_lut_mtime = 0;
+    g_lut_ino = 0;
+    logmsg("lut: active LUT unusable, falling back to %s", g_lut_default);
+    if (lut_maybe_reload() == 0) return 0;
+
+    logmsg("lut: no usable LUT at all");
+    return -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -500,7 +524,15 @@ static void apply_row(const Lut *L, unsigned char *row, int w)
             int v5 = lerp8(v2, v3, gf);
             int v = lerp8(v4, v5, bf);
             int o = (v * 255 + 32768) >> 16;
-            p[c] = (unsigned char)(o < 0 ? 0 : o > 255 ? 255 : o);
+            if (o < 0) o = 0;
+            if (o > 255) o = 255;
+            if (g_strength < 100) {          /* 和原色按比例混合 */
+                int orig = p[c];
+                o = orig + ((o - orig) * g_strength + 50) / 100;
+                if (o < 0) o = 0;
+                if (o > 255) o = 255;
+            }
+            p[c] = (unsigned char)o;
         }
     }
 }
@@ -949,6 +981,7 @@ typedef struct {
     char led[192];
     int hotkey;
     int probe_keys;
+    int strength;
     int srw;
     int quality;
     long min_bytes;
@@ -983,6 +1016,7 @@ static void cfg_defaults(Cfg *c)
     snprintf(c->led, sizeof c->led, "%s", "/sys/class/leds/card/brightness");
     c->hotkey = 0;
     c->probe_keys = 0;
+    c->strength = 100;
     c->srw = 1;
     c->quality = 92;
     c->min_bytes = 100000;
@@ -1026,6 +1060,11 @@ static void cfg_load(Cfg *c, const char *path)
         else if (!strcasecmp(p, "LED")) snprintf(c->led, sizeof c->led, "%s", eq);
         else if (!strcasecmp(p, "HOTKEY")) c->hotkey = atoi(eq);
         else if (!strcasecmp(p, "PROBE_KEYS")) c->probe_keys = atoi(eq) != 0;
+        else if (!strcasecmp(p, "LUT_STRENGTH")) {
+            c->strength = atoi(eq);
+            if (c->strength < 0) c->strength = 0;
+            if (c->strength > 100) c->strength = 100;
+        }
         else if (!strcasecmp(p, "SRW")) c->srw = atoi(eq) != 0;
         else if (!strcasecmp(p, "QUALITY")) c->quality = atoi(eq);
         else if (!strcasecmp(p, "MIN_BYTES")) c->min_bytes = atol(eq);
@@ -1411,8 +1450,9 @@ static int daemon_run(Cfg *cfg)
     snprintf(g_led, sizeof g_led, "%s", cfg->led);
     g_hotkey = cfg->hotkey;
     g_probe_keys = cfg->probe_keys;
+    g_strength = cfg->strength;
     input_open();
-    if (lut_maybe_reload() != 0) {
+    if (lut_init() != 0) {
         logmsg("cannot load any LUT (tried %s/active and %s)", g_lut_dir, cfg->lut);
         return 1;
     }
@@ -1521,7 +1561,7 @@ int main(int argc, char **argv)
         printf("watch=%s\nlut=%s\nmode=%s\nsrw=%d\n",
                c.watch, c.lut, c.mode, c.srw);
         lut_set_paths(c.lut);
-        if (lut_maybe_reload() != 0) { printf("lut: FAILED\n"); return 1; }
+        if (lut_init() != 0) { printf("lut: FAILED\n"); return 1; }
         printf("lut: ok, 3D %d^3, 1D %d, path %s\n", g_lut.n3, g_lut.n1, g_lut_cur);
         printf("selftest ok\n");
         return 0;
